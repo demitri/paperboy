@@ -1,3 +1,8 @@
+
+# This is too big to keep in repo. Use scripts to recreate.
+arxiv_index.db
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
