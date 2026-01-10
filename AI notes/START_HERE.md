@@ -6,6 +6,51 @@ Paperboy is a Python microservice that delivers individual academic papers from 
 
 **Core problem solved**: arXiv distributes papers in massive bulk tar files (multiple GB each). Paperboy uses byte-level direct reads from tar files, enabled by a pre-built SQLite index.
 
+## Key Features for AI Agents
+
+### 1. Metadata in Response Headers
+Every paper retrieval includes metadata headers:
+```
+X-Paper-ID: 2103.06497
+X-Paper-Format: source
+X-Paper-File-Type: gzip
+X-Paper-Year: 2021
+X-Paper-Version: 2
+X-Paper-Source: upstream
+```
+
+### 2. File Type Signaling
+Papers are returned with correct `Content-Type`:
+- `application/pdf` - PDF file
+- `application/gzip` - Gzipped LaTeX source
+- `application/x-tar` - Tar archive
+
+Check `X-Paper-File-Type` header or call `/paper/{id}/info` before downloading.
+
+### 3. Version-Specific Retrieval
+Request exact versions with strict matching:
+```bash
+GET /paper/2103.06497v2    # Returns v2 or 404 (never falls back)
+GET /paper/2103.06497      # Returns whatever version is available
+```
+
+### 4. Format Filtering
+Request specific formats:
+```bash
+GET /paper/2103.06497?format=pdf      # PDF only, 404 if unavailable
+GET /paper/2103.06497?format=source   # Source only (gzip/tar)
+GET /paper/2103.06497?format=preferred # Whatever is available (default)
+```
+
+### 5. Metadata Endpoint
+Get paper info without downloading:
+```bash
+GET /paper/2103.06497/info
+```
+Returns JSON with `paper_id`, `file_type`, `format`, `size_bytes`, `year`, `locally_available`, `source`.
+
+---
+
 ## Project Structure
 
 ```
