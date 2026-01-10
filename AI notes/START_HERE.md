@@ -21,6 +21,7 @@ paperboy/
 ├── source/paperboy/        # Main application code
 │   ├── main.py             # FastAPI application (endpoints)
 │   ├── retriever.py        # Paper retrieval logic
+│   ├── cache.py            # LRU disk cache for offline access
 │   └── config.py           # Pydantic settings configuration
 │
 ├── extract_paper.py        # CLI tool to extract individual papers
@@ -68,27 +69,142 @@ cat AI notes/START_HERE.md
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/` | GET | HTML search form |
-| `/paper/{paper_id}` | GET | Retrieve paper by ID |
-| `/download` | POST | Form submission handler |
-| `/debug/config` | GET | Debug configuration |
+| `/paper/{paper_id}` | GET | **Primary endpoint** - Retrieve paper by ID |
+| `/paper/{paper_id}/info` | GET | Get paper metadata without downloading |
+| `/health` | GET | Health check for monitoring |
+| `/debug/config` | GET | Debug configuration and cache stats |
+| `/` | GET | HTML search form (for humans) |
+| `/download` | POST | Form submission handler (for humans) |
+
+### API Reference for AI Agents
+
+Interactive API documentation is available at `/docs` (Swagger UI) or `/redoc` when the server is running.
+
+#### GET /paper/{paper_id}
+
+**This is the primary endpoint for programmatic access.**
+
+Retrieves raw paper content (PDF or gzipped LaTeX source) by arXiv ID.
+
+**Paper ID formats accepted:**
+- `1501.00963` - Modern arXiv ID (YYMM.NNNNN)
+- `arXiv:1501.00963v3` - With prefix and version (version is respected - returns 404 if not found)
+- `astro-ph/0412561` - Old format with category and slash
+- `astro-ph0412561` - Old format without slash
+- `https://arxiv.org/abs/1501.00963` - Full arXiv URL
+
+**Query parameters:**
+- `format` - Filter by format:
+  - `pdf` - Only return PDF, 404 if unavailable
+  - `source` - Only return source (gzip/tar), 404 if unavailable
+  - `preferred` - Return whatever is available (default)
+
+**Version handling:**
+- If you specify a version (e.g., `1501.00963v2`), that exact version must exist
+- If version not found, returns 404 (does not fall back to other versions)
+- If no version specified, returns whatever version is available
+
+**Response:**
+- Success (200): Raw binary content with correct Content-Type:
+  - `application/pdf` for PDF files
+  - `application/gzip` for gzip-compressed LaTeX source
+  - `application/x-tar` for tar archives
+- Not Found (404): Paper not found, version not found, or format unavailable
+
+**Example requests:**
+```bash
+# Get paper (any format)
+curl http://localhost:8000/paper/2103.06497 --output paper.pdf
+
+# Request specific format
+curl "http://localhost:8000/paper/2103.06497?format=pdf" --output paper.pdf
+curl "http://localhost:8000/paper/2103.06497?format=source" --output paper.gz
+
+# Request specific version
+curl http://localhost:8000/paper/2103.06497v2 --output paper.pdf
+```
+
+#### GET /paper/{paper_id}/info
+
+Get metadata about a paper without downloading its content. Use this to check availability and format before downloading.
+
+**Response (JSON):**
+```json
+{
+  "paper_id": "2103.06497",
+  "requested_version": null,
+  "file_type": "pdf",
+  "format": "pdf",
+  "size_bytes": 1234567,
+  "year": 2021,
+  "locally_available": true,
+  "upstream_configured": true
+}
+```
+
+**Example:**
+```bash
+curl http://localhost:8000/paper/2103.06497/info
+```
+
+#### GET /health
+
+Returns service health status as JSON.
+
+**Response fields:**
+- `status`: "healthy" or "unhealthy"
+- `startup_error`: Error message if service failed to start
+- `upstream_configured`: Whether fallback server is configured
+- `upstream_enabled`: Whether fallback is enabled
+- `cache_configured`: Whether paper caching is enabled
+
+#### GET /debug/config
+
+Returns full configuration details and cache statistics as JSON.
 
 ## Configuration
 
 Via `.env` file or environment variables:
+
+**Required:**
 - `INDEX_DB_PATH` - Path to SQLite index database
 - `TAR_DIR_PATH` - Path to directory containing tar archives
+
+**Optional - Upstream fallback:**
+- `UPSTREAM_SERVER_URL` - URL of upstream Paperboy server for fallback
+- `UPSTREAM_TIMEOUT` - Timeout in seconds (default: 30.0)
+- `UPSTREAM_ENABLED` - Enable/disable upstream fallback (default: true)
+
+**Optional - Caching:**
+- `CACHE_DIR_PATH` - Directory for paper cache (enables offline access)
+- `CACHE_MAX_SIZE_GB` - Maximum cache size in GB (default: 1.0)
+
+The cache stores papers retrieved from upstream or local archives. When the cache is full, least recently used papers are evicted first (LRU policy).
 
 ## Key Files to Understand
 
 1. **`source/paperboy/retriever.py`** - Core paper retrieval logic with detailed error handling
-2. **`source/paperboy/main.py`** - FastAPI endpoints
-3. **`index/index_arxiv_bulk_files.py`** - Index building script
+2. **`source/paperboy/main.py`** - FastAPI endpoints (see `/docs` for interactive API docs)
+3. **`source/paperboy/cache.py`** - LRU disk cache for offline paper access
+4. **`index/index_arxiv_bulk_files.py`** - Index building script
 
 ## Supported Paper ID Formats
 
-- Old format: `hep-lat9107001`, `astro-ph9205002`
-- New format: `1234.5678`, `2103.06497`
+**Modern format (post-2007):**
+- `1234.5678` or `2103.06497`
+- With version: `2103.06497v2` (returns exact version or 404)
+
+**Old format (pre-2007):**
+- `hep-lat9107001`, `astro-ph9205002`
+- With slash: `astro-ph/9205002`
+
+**With prefixes:**
+- `arXiv:2103.06497v3`
+- `arxiv:astro-ph/0412561`
+
+**Full URLs:**
+- `https://arxiv.org/abs/2103.06497`
+- `https://arxiv.org/pdf/2103.06497.pdf`
 
 ## Current Status
 

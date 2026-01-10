@@ -12,5 +12,9 @@ class Settings(BaseSettings):
     UPSTREAM_TIMEOUT: float = 30.0
     UPSTREAM_ENABLED: bool = True
 
+    # Cache configuration for offline paper retrieval
+    CACHE_DIR_PATH: Optional[str] = None
+    CACHE_MAX_SIZE_GB: float = 1.0
+
     class Config:
         env_file = ".env"
