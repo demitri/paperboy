@@ -12,9 +12,12 @@ import sqlite3
 import os
 import tarfile
 import hashlib
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Set, Tuple, Optional
+from typing import List, Tuple, Optional
 import logging
+import multiprocessing
 
 # Configure logging
 logging.basicConfig(
@@ -146,6 +149,82 @@ def determine_file_type(tar_entry_name: str) -> str:
         return 'unknown'
 
 
+@dataclass
+class TarFileResult:
+    """Result from processing a single tar file."""
+    tar_path: str
+    relative_path: str
+    file_hash: str
+    mtime: float
+    year: int
+    entries: List[Tuple[str, str, int, int, str, int]]  # (paper_id, archive_file, offset, size, file_type, year)
+    error: Optional[str] = None
+
+
+def process_tar_file_worker(args: Tuple[str, str, int]) -> TarFileResult:
+    """
+    Worker function to process a single tar file.
+    Runs in a separate process - no database access.
+
+    Args:
+        args: Tuple of (tar_path, root_dir, year)
+
+    Returns:
+        TarFileResult with file hash and all paper entries
+    """
+    tar_path, root_dir, year = args
+    relative_path = os.path.relpath(tar_path, root_dir)
+    entries = []
+
+    try:
+        # Calculate MD5 hash
+        hash_md5 = hashlib.md5()
+        with open(tar_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                hash_md5.update(chunk)
+        file_hash = hash_md5.hexdigest()
+
+        # Get mtime
+        mtime = os.stat(tar_path).st_mtime
+
+        # Read tar file entries
+        with open(tar_path, 'rb') as f:
+            with tarfile.open(fileobj=f, mode='r|') as tar:
+                for member in tar:
+                    if member.isfile():
+                        paper_id = extract_paper_id(member.name)
+                        if paper_id:
+                            file_type = determine_file_type(member.name)
+                            entries.append((
+                                paper_id,
+                                relative_path,
+                                member.offset_data,
+                                member.size,
+                                file_type,
+                                year
+                            ))
+
+        return TarFileResult(
+            tar_path=tar_path,
+            relative_path=relative_path,
+            file_hash=file_hash,
+            mtime=mtime,
+            year=year,
+            entries=entries
+        )
+
+    except Exception as e:
+        return TarFileResult(
+            tar_path=tar_path,
+            relative_path=relative_path,
+            file_hash="",
+            mtime=0,
+            year=year,
+            entries=[],
+            error=str(e)
+        )
+
+
 def index_tar_file(conn: sqlite3.Connection, tar_path: str, year: int, root_dir: str):
     """Index a single tar file and add entries to the database."""
     logger.info(f"Indexing tar file: {tar_path}")
@@ -191,58 +270,125 @@ def index_tar_file(conn: sqlite3.Connection, tar_path: str, year: int, root_dir:
         raise
 
 
-def scan_arxiv_directory(root_dir: str, db_path: str):
-    """Scan the arXiv directory structure and build the index."""
+def get_processed_files(conn: sqlite3.Connection) -> dict:
+    """Get all processed files with their hashes and mtimes."""
+    cursor = conn.cursor()
+    cursor.execute('SELECT file_path, file_hash, last_modified FROM bulk_files')
+    return {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+
+
+def scan_arxiv_directory(root_dir: str, db_path: str, num_workers: int = None):
+    """Scan the arXiv directory structure and build the index using parallel processing."""
+    if num_workers is None:
+        num_workers = max(1, multiprocessing.cpu_count() - 1)
+
     logger.info(f"Scanning arXiv directory: {root_dir}")
-    
+    logger.info(f"Using {num_workers} worker processes")
+
     conn = create_database_schema(db_path)
-    
+
     try:
         root_path = Path(root_dir)
         if not root_path.exists():
             raise ValueError(f"Root directory does not exist: {root_dir}")
-        
-        # Iterate through year directories
+
+        # Get already processed files
+        processed_files = get_processed_files(conn)
+        logger.info(f"Found {len(processed_files)} previously processed files")
+
+        # Collect all tar files to process
+        work_items = []
+        skipped_count = 0
+
         for year_dir in sorted(root_path.iterdir()):
             if year_dir.is_dir() and year_dir.name.isdigit():
                 year = int(year_dir.name)
-                logger.info(f"Processing year: {year}")
-                
-                # Find all tar files in the year directory
                 tar_files = list(year_dir.glob("*.tar"))
-                logger.info(f"Found {len(tar_files)} tar files for year {year}")
-                
+
                 for tar_file in sorted(tar_files):
                     tar_path_str = str(tar_file)
-                    
-                    # Check if file has already been processed
-                    if is_file_processed(conn, tar_path_str, str(root_path)):
-                        logger.info(f"Skipping already processed file: {tar_file.name}")
+                    relative_path = os.path.relpath(tar_path_str, str(root_path))
+
+                    # Quick check using cached data (skip full hash check here)
+                    if relative_path in processed_files:
+                        cached_hash, cached_mtime = processed_files[relative_path]
+                        current_mtime = os.stat(tar_path_str).st_mtime
+                        if current_mtime == cached_mtime:
+                            skipped_count += 1
+                            continue
+
+                    work_items.append((tar_path_str, str(root_path), year))
+
+        logger.info(f"Skipped {skipped_count} unchanged files")
+        logger.info(f"Processing {len(work_items)} tar files")
+
+        if not work_items:
+            logger.info("No new files to process")
+            return
+
+        # Process files in parallel
+        total_entries = 0
+        files_processed = 0
+        files_failed = 0
+
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(process_tar_file_worker, item): item for item in work_items}
+
+            for future in as_completed(futures):
+                result = future.result()
+
+                if result.error:
+                    logger.error(f"Failed to process {result.tar_path}: {result.error}")
+                    files_failed += 1
+                    continue
+
+                # Check if hash changed (file was modified during processing)
+                relative_path = result.relative_path
+                if relative_path in processed_files:
+                    cached_hash, _ = processed_files[relative_path]
+                    if cached_hash == result.file_hash:
+                        logger.debug(f"Skipping {result.tar_path} - hash unchanged")
                         continue
-                    
-                    try:
-                        index_tar_file(conn, tar_path_str, year, str(root_path))
-                        mark_file_processed(conn, tar_path_str, str(root_path))
-                    except Exception as e:
-                        logger.error(f"Failed to process {tar_file}: {e}")
-                        continue
-        
+
+                # Batch insert entries
+                cursor = conn.cursor()
+                cursor.executemany('''
+                    INSERT OR REPLACE INTO paper_index
+                    (paper_id, archive_file, offset, size, file_type, year)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', result.entries)
+
+                # Mark file as processed
+                cursor.execute('''
+                    INSERT OR REPLACE INTO bulk_files (file_path, file_hash, last_modified)
+                    VALUES (?, ?, ?)
+                ''', (result.relative_path, result.file_hash, result.mtime))
+
+                conn.commit()
+
+                files_processed += 1
+                total_entries += len(result.entries)
+                logger.info(f"Indexed {result.relative_path}: {len(result.entries)} entries")
+
         # Print summary statistics
         cursor = conn.cursor()
         cursor.execute('SELECT COUNT(*) FROM paper_index')
         total_papers = cursor.fetchone()[0]
-        
+
         cursor.execute('SELECT COUNT(DISTINCT year) FROM paper_index')
         total_years = cursor.fetchone()[0]
-        
+
         cursor.execute('SELECT COUNT(DISTINCT archive_file) FROM paper_index')
         total_archives = cursor.fetchone()[0]
-        
+
         logger.info(f"Indexing complete!")
-        logger.info(f"Total papers indexed: {total_papers}")
+        logger.info(f"Files processed this run: {files_processed}")
+        logger.info(f"Files failed: {files_failed}")
+        logger.info(f"Entries added this run: {total_entries}")
+        logger.info(f"Total papers in index: {total_papers}")
         logger.info(f"Years covered: {total_years}")
-        logger.info(f"Archive files processed: {total_archives}")
-        
+        logger.info(f"Archive files in index: {total_archives}")
+
     finally:
         conn.close()
 
@@ -337,6 +483,15 @@ def index_single_file(file_input: str, root_dir: str, db_path: str):
         conn.close()
 
 
+def get_default_db_path() -> Optional[str]:
+    """Get default database path in the same directory as this script."""
+    script_dir = Path(__file__).parent.resolve()
+    default_path = script_dir / "arXiv_manifest.sqlite3"
+    if default_path.exists():
+        return str(default_path)
+    return None
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -348,8 +503,8 @@ def main():
     )
     parser.add_argument(
         "--db-path",
-        default="arxiv_index.db",
-        help="Path to SQLite database file (default: arxiv_index.db)"
+        default=None,
+        help="Path to SQLite database file (default: arXiv_manifest.sqlite3 in script directory)"
     )
     parser.add_argument(
         "--single-file",
@@ -360,17 +515,34 @@ def main():
         action="store_true",
         help="Enable verbose logging"
     )
-    
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=None,
+        help="Number of parallel workers (default: CPU count - 1)"
+    )
+
     args = parser.parse_args()
-    
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-    
+
+    # Resolve database path
+    db_path = args.db_path
+    if db_path is None:
+        db_path = get_default_db_path()
+        if db_path is None:
+            script_dir = Path(__file__).parent.resolve()
+            logger.error(f"Database file not found: {script_dir / 'arXiv_manifest.sqlite3'}")
+            logger.error("Please specify the database path with --db-path")
+            return 1
+        logger.info(f"Using database: {db_path}")
+
     try:
         if args.single_file:
-            index_single_file(args.single_file, args.root_dir, args.db_path)
+            index_single_file(args.single_file, args.root_dir, db_path)
         else:
-            scan_arxiv_directory(args.root_dir, args.db_path)
+            scan_arxiv_directory(args.root_dir, db_path, num_workers=args.workers)
     except Exception as e:
         logger.error(f"Failed to build index: {e}")
         return 1

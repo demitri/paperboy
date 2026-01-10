@@ -1,0 +1,43 @@
+services:
+  # Main server with full archive (run on the server with 1TB+ tar files)
+  paperboy-main:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - INDEX_DB_PATH=/data/index/arxiv_index.db
+      - TAR_DIR_PATH=/data/arxiv
+    volumes:
+      - ./index:/data/index:ro
+      - /path/to/arxiv/tar/files:/data/arxiv:ro  # Update this path
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Satellite server with subset of tar files (fallback to main when needed)
+  paperboy-satellite:
+    build: .
+    ports:
+      - "8001:8000"
+    environment:
+      - INDEX_DB_PATH=/data/index/arxiv_index.db
+      - TAR_DIR_PATH=/data/arxiv
+      - UPSTREAM_SERVER_URL=http://paperboy-main:8000
+      - UPSTREAM_TIMEOUT=30
+      - UPSTREAM_ENABLED=true
+    volumes:
+      - ./index:/data/index:ro
+      - /path/to/local/arxiv:/data/arxiv:ro  # Update: smaller subset of tar files
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  default:
+    name: paperboy-network

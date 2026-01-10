@@ -1,6 +1,7 @@
 
-# This is too big to keep in repo. Use scripts to recreate.
+# This is too big to keep in repo. Use scripts to recreate (or just copy it as needed).
 arxiv_index.db
+arXiv_manifest.sqlite3
 
 
 # Byte-compiled / optimized / DLL files

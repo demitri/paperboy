@@ -339,6 +339,18 @@ async def download_paper(paper_id: str = Form(...)):
     )
 
 
+@app.get("/health")
+async def health():
+    """Health check endpoint for load balancers and monitoring"""
+    import os
+    return {
+        "status": "healthy" if retriever else "unhealthy",
+        "startup_error": startup_error,
+        "upstream_configured": bool(settings.UPSTREAM_SERVER_URL),
+        "upstream_enabled": settings.UPSTREAM_ENABLED,
+    }
+
+
 @app.get("/debug/config")
 async def debug_config():
     """Debug endpoint to check configuration"""
@@ -346,6 +358,9 @@ async def debug_config():
     return {
         "INDEX_DB_PATH": settings.INDEX_DB_PATH,
         "TAR_DIR_PATH": settings.TAR_DIR_PATH,
+        "UPSTREAM_SERVER_URL": settings.UPSTREAM_SERVER_URL,
+        "UPSTREAM_TIMEOUT": settings.UPSTREAM_TIMEOUT,
+        "UPSTREAM_ENABLED": settings.UPSTREAM_ENABLED,
         "db_exists": os.path.exists(settings.INDEX_DB_PATH),
         "tar_dir_exists": os.path.exists(settings.TAR_DIR_PATH),
         "working_directory": os.getcwd()

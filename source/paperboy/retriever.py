@@ -1,8 +1,13 @@
+import logging
 import sqlite3
 import os
 from typing import Optional, Tuple
 
+import httpx
+
 from .config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class RetrievalError(Exception):
@@ -14,10 +19,13 @@ class PaperRetriever:
     def __init__(self, settings: Settings):
         self.index_db_path = settings.INDEX_DB_PATH
         self.tar_dir_path = settings.TAR_DIR_PATH
-        
+        self.upstream_url = settings.UPSTREAM_SERVER_URL
+        self.upstream_timeout = settings.UPSTREAM_TIMEOUT
+        self.upstream_enabled = settings.UPSTREAM_ENABLED
+
         # Validate configuration at startup
         self._validate_config()
-        
+
         # Connect to database
         try:
             self.db_connection = sqlite3.connect(self.index_db_path)
@@ -28,27 +36,31 @@ class PaperRetriever:
         """Validate the configuration settings"""
         if not self.index_db_path:
             raise RetrievalError("INDEX_DB_PATH not configured")
-        
+
         if not self.tar_dir_path:
             raise RetrievalError("TAR_DIR_PATH not configured")
-        
+
         if not os.path.exists(self.index_db_path):
             raise RetrievalError(f"Database file not found: {self.index_db_path}")
-        
+
         if not os.path.exists(self.tar_dir_path):
             raise RetrievalError(f"Root directory not found: {self.tar_dir_path}")
-        
+
         # Check if the directory structure looks like arXiv (has year subdirectories)
-        year_dirs = [d for d in os.listdir(self.tar_dir_path) 
+        year_dirs = [d for d in os.listdir(self.tar_dir_path)
                     if os.path.isdir(os.path.join(self.tar_dir_path, d)) and d.isdigit()]
-        
+
         if not year_dirs:
-            raise RetrievalError(f"Root directory doesn't contain expected year subdirectories: {self.tar_dir_path}")
+            # Warn instead of error - allows empty tar dir when upstream is configured
+            if self.upstream_url and self.upstream_enabled:
+                logger.warning(f"No year subdirectories in {self.tar_dir_path} - will rely on upstream for all papers")
+            else:
+                raise RetrievalError(f"Root directory doesn't contain expected year subdirectories: {self.tar_dir_path}")
     
-    def get_source_by_id(self, paper_id: str) -> Optional[bytes]:
+    def _get_from_local(self, paper_id: str) -> Optional[bytes]:
         """
-        Get paper source by ID.
-        Returns None if paper not found, raises RetrievalError for other issues.
+        Attempt to retrieve paper from local storage.
+        Returns None if paper not found or tar file not available locally.
         """
         cursor = self.db_connection.cursor()
         cursor.execute(
@@ -56,26 +68,70 @@ class PaperRetriever:
             (paper_id,)
         )
         result = cursor.fetchone()
-        
+
         if result is None:
             return None
-        
+
         archive_file, offset, size = result
         tar_file_path = os.path.join(self.tar_dir_path, archive_file)
-        
-        # Check if tar file exists
+
+        # Check if tar file exists locally
         if not os.path.exists(tar_file_path):
-            raise RetrievalError(f"Archive file not found: {tar_file_path}")
-        
+            logger.debug(f"Tar file not available locally: {tar_file_path}")
+            return None
+
         try:
             with open(tar_file_path, 'rb') as file:
                 file.seek(offset)
-                file_content = file.read(size)
-                return file_content
-        except PermissionError:
-            raise RetrievalError(f"Permission denied accessing archive file: {tar_file_path}")
-        except OSError as e:
-            raise RetrievalError(f"Error reading archive file {tar_file_path}: {e}")
+                return file.read(size)
+        except (PermissionError, OSError) as e:
+            logger.warning(f"Error reading local tar file {tar_file_path}: {e}")
+            return None
+
+    def _get_from_upstream(self, paper_id: str) -> Optional[bytes]:
+        """
+        Attempt to retrieve paper from upstream server.
+        Returns None if upstream not configured, disabled, or request fails.
+        """
+        if not self.upstream_url or not self.upstream_enabled:
+            return None
+
+        try:
+            with httpx.Client(timeout=self.upstream_timeout) as client:
+                response = client.get(f"{self.upstream_url}/paper/{paper_id}")
+
+                if response.status_code == 200:
+                    return response.content
+                elif response.status_code == 404:
+                    return None
+                else:
+                    logger.warning(f"Upstream returned status {response.status_code} for {paper_id}")
+                    return None
+
+        except httpx.TimeoutException:
+            logger.warning(f"Upstream timeout for paper {paper_id}")
+            return None
+        except httpx.RequestError as e:
+            logger.warning(f"Upstream request error for paper {paper_id}: {e}")
+            return None
+
+    def get_source_by_id(self, paper_id: str) -> Optional[bytes]:
+        """
+        Get paper source by ID.
+        Tries local storage first, then falls back to upstream if configured.
+        Returns None if paper not found in both locations.
+        """
+        # Try local first
+        result = self._get_from_local(paper_id)
+        if result is not None:
+            return result
+
+        # Try upstream if configured
+        result = self._get_from_upstream(paper_id)
+        if result is not None:
+            return result
+
+        return None
     
     def get_detailed_error(self, paper_id: str) -> Tuple[str, str]:
         """
@@ -115,13 +171,16 @@ class PaperRetriever:
             # Paper exists in DB, check file access
             archive_file, offset, size = result
             tar_file_path = os.path.join(self.tar_dir_path, archive_file)
-            
+
             if not os.path.exists(tar_file_path):
-                return ("archive_missing", f"Archive file not found: {tar_file_path}")
-            
+                msg = f"Archive file not found locally: {tar_file_path}"
+                if self.upstream_url and self.upstream_enabled:
+                    msg += f" (upstream at {self.upstream_url} was also unavailable or returned not found)"
+                return ("archive_missing", msg)
+
             if not os.access(tar_file_path, os.R_OK):
                 return ("permission_denied", f"Permission denied accessing archive file: {tar_file_path}")
-            
+
             return ("unknown_error", "Unknown error occurred during paper retrieval.")
             
         except sqlite3.Error as e:
