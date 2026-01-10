@@ -27,12 +27,15 @@ Papers are returned with correct `Content-Type`:
 
 Check `X-Paper-File-Type` header or call `/paper/{id}/info` before downloading.
 
-### 3. Version-Specific Retrieval
-Request exact versions with strict matching:
+### 3. Version Handling
+**Important limitation:** arXiv bulk tar files only contain the latest version of each paper - version numbers are not preserved. Requesting a specific version (e.g., `v3`) will return 404 unless that version happens to be indexed.
+
 ```bash
-GET /paper/2103.06497v2    # Returns v2 or 404 (never falls back)
-GET /paper/2103.06497      # Returns whatever version is available
+GET /paper/2103.06497      # Returns latest available version
+GET /paper/2103.06497v2    # Returns 404 (versions not in bulk archives)
 ```
+
+For specific historical versions, use the arXiv API directly: `https://arxiv.org/abs/2103.06497v2`
 
 ### 4. Format Filtering
 Request specific formats:
@@ -145,9 +148,10 @@ Retrieves raw paper content (PDF or gzipped LaTeX source) by arXiv ID.
   - `preferred` - Return whatever is available (default)
 
 **Version handling:**
-- If you specify a version (e.g., `1501.00963v2`), that exact version must exist
-- If version not found, returns 404 (does not fall back to other versions)
-- If no version specified, returns whatever version is available
+- arXiv bulk archives only contain the latest version - version suffixes are not preserved
+- Requesting a specific version (e.g., `1501.00963v2`) will return 404
+- Omit the version suffix to get the latest available version
+- For historical versions, use arXiv directly: `https://arxiv.org/pdf/1501.00963v2.pdf`
 
 **Response:**
 - Success (200): Raw binary content with correct Content-Type:
@@ -250,19 +254,20 @@ The cache stores papers retrieved from upstream or local archives. When the cach
 
 **Modern format (post-2007):**
 - `1234.5678` or `2103.06497`
-- With version: `2103.06497v2` (returns exact version or 404)
 
 **Old format (pre-2007):**
 - `hep-lat9107001`, `astro-ph9205002`
 - With slash: `astro-ph/9205002`
 
 **With prefixes:**
-- `arXiv:2103.06497v3`
+- `arXiv:2103.06497`
 - `arxiv:astro-ph/0412561`
 
 **Full URLs:**
 - `https://arxiv.org/abs/2103.06497`
 - `https://arxiv.org/pdf/2103.06497.pdf`
+
+**Note:** Version suffixes (e.g., `v2`, `v3`) are accepted but will return 404 - bulk archives only contain the latest version. Strip the version suffix to retrieve papers.
 
 ## Current Status
 
