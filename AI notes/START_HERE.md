@@ -15,7 +15,7 @@ paperboy/
 │   └── TODO.md             # Task tracking, progress, blockers
 │
 ├── index/                  # Indexing components
-│   ├── arxiv_index.db      # SQLite index database (884K+ papers)
+│   ├── arXiv_manifest.sqlite3    # SQLite index database (1.27M+ papers, not committed)
 │   └── index_arxiv_bulk_files.py  # Script to build/update the index
 │
 ├── source/paperboy/        # Main application code
@@ -130,7 +130,8 @@ Run the indexer pointing to your tar directory. It will:
 - Index only new or modified files
 
 ```bash
-python index/index_arxiv_bulk_files.py /path/to/arxiv/tar --db-path index/arxiv_index.db
+# Uses paths from .env: INDEX_DB_PATH and TAR_DIR_PATH
+python index/index_arxiv_bulk_files.py $TAR_DIR_PATH --db-path $INDEX_DB_PATH
 ```
 
 Add `-v` for verbose output to see detailed progress.
@@ -141,10 +142,10 @@ To index just one new tar file:
 
 ```bash
 # By filename (looks in appropriate year directory based on filename)
-python index/index_arxiv_bulk_files.py /path/to/arxiv/tar --db-path index/arxiv_index.db --single-file arXiv_pdf_2501_001.tar
+python index/index_arxiv_bulk_files.py $TAR_DIR_PATH --db-path $INDEX_DB_PATH --single-file arXiv_pdf_2501_001.tar
 
 # By absolute path
-python index/index_arxiv_bulk_files.py /path/to/arxiv/tar --db-path index/arxiv_index.db --single-file /path/to/arxiv/2025/arXiv_pdf_2501_001.tar
+python index/index_arxiv_bulk_files.py $TAR_DIR_PATH --db-path $INDEX_DB_PATH --single-file /path/to/arxiv/2025/arXiv_pdf_2501_001.tar
 ```
 
 ### What the Indexer Does
@@ -164,6 +165,6 @@ python index/index_arxiv_bulk_files.py /path/to/arxiv/tar --db-path index/arxiv_
 After indexing, check the database:
 
 ```bash
-sqlite3 index/arxiv_index.db "SELECT COUNT(*) FROM paper_index;"
-sqlite3 index/arxiv_index.db "SELECT COUNT(*) FROM bulk_files;"
+sqlite3 $INDEX_DB_PATH "SELECT COUNT(*) FROM paper_index;"
+sqlite3 $INDEX_DB_PATH "SELECT COUNT(*) FROM bulk_files;"
 ```

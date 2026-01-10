@@ -1,4 +1,5 @@
 import logging
+import re
 import sqlite3
 import os
 from typing import Optional, Tuple
@@ -8,6 +9,52 @@ import httpx
 from .config import Settings
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_paper_id(paper_id: str) -> str:
+    """
+    Normalize various arXiv paper ID formats to the canonical form stored in the database.
+
+    Accepted formats:
+    - arXiv:1501.00963v3 -> 1501.00963
+    - arxiv:1501.00963 -> 1501.00963
+    - 1501.00963v2 -> 1501.00963
+    - https://arxiv.org/abs/1501.00963 -> 1501.00963
+    - https://arxiv.org/pdf/1501.00963.pdf -> 1501.00963
+    - astro-ph/0412561 -> astro-ph0412561
+    - arXiv:astro-ph/0412561v1 -> astro-ph0412561
+    """
+    original = paper_id
+    paper_id = paper_id.strip()
+
+    # Handle URLs
+    url_patterns = [
+        r'https?://(?:export\.)?arxiv\.org/(?:abs|pdf)/(.+?)(?:\.pdf)?$',
+        r'https?://(?:export\.)?arxiv\.org/(?:abs|pdf)/(.+?)(?:\.pdf)?(?:\?.*)?$',
+    ]
+    for pattern in url_patterns:
+        match = re.match(pattern, paper_id, re.IGNORECASE)
+        if match:
+            paper_id = match.group(1)
+            break
+
+    # Strip "arXiv:" or "arxiv:" prefix
+    paper_id = re.sub(r'^arxiv:\s*', '', paper_id, flags=re.IGNORECASE)
+
+    # Strip version suffix (v1, v2, etc.)
+    paper_id = re.sub(r'v\d+$', '', paper_id)
+
+    # Handle old format with slash: astro-ph/0412561 -> astro-ph0412561
+    # But preserve the category prefix
+    if '/' in paper_id:
+        parts = paper_id.split('/')
+        if len(parts) == 2:
+            category, number = parts
+            # Old categories like astro-ph, hep-lat, etc.
+            paper_id = f"{category}{number}"
+
+    logger.debug(f"Normalized paper ID: '{original}' -> '{paper_id}'")
+    return paper_id
 
 
 class RetrievalError(Exception):
@@ -121,6 +168,9 @@ class PaperRetriever:
         Tries local storage first, then falls back to upstream if configured.
         Returns None if paper not found in both locations.
         """
+        # Normalize the paper ID to handle various input formats
+        paper_id = normalize_paper_id(paper_id)
+
         # Try local first
         result = self._get_from_local(paper_id)
         if result is not None:
@@ -138,6 +188,9 @@ class PaperRetriever:
         Get detailed error information for debugging.
         Returns (error_type, error_message) tuple.
         """
+        # Normalize the paper ID to match what was searched
+        paper_id = normalize_paper_id(paper_id)
+
         try:
             # Check database connection
             cursor = self.db_connection.cursor()

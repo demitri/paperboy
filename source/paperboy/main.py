@@ -126,20 +126,21 @@ async def root(request: Request):
         <form action="/download" method="post">
             <div class="form-group">
                 <label for="paper_id">arXiv Paper ID:</label>
-                <input type="text" id="paper_id" name="paper_id" 
-                       placeholder="e.g., hep-lat9107001, astro-ph9205002, 1234.5678" 
+                <input type="text" id="paper_id" name="paper_id"
+                       placeholder="e.g., arXiv:1501.00963v3, 2103.06497, astro-ph/9205002"
                        required>
             </div>
             <button type="submit">Download Paper</button>
         </form>
-        
+
         <div class="examples">
-            <h3>Example Paper IDs:</h3>
+            <h3>Accepted Formats:</h3>
             <ul>
-                <li><code>hep-lat9107001</code> - Old format with subject class</li>
-                <li><code>astro-ph9205002</code> - Astrophysics paper from 1992</li>
-                <li><code>1234.5678</code> - New format (year.number)</li>
-                <li><code>2103.06497</code> - Paper from March 2021</li>
+                <li><code>arXiv:1501.00963v3</code> - With prefix and version</li>
+                <li><code>1501.00963</code> - Just the ID</li>
+                <li><code>astro-ph/0412561</code> - Old format with slash</li>
+                <li><code>astro-ph0412561</code> - Old format without slash</li>
+                <li><code>https://arxiv.org/abs/1501.00963</code> - Full URL</li>
             </ul>
         </div>
     </div>
@@ -367,7 +368,7 @@ async def debug_config():
     }
 
 
-@app.get("/paper/{paper_id}")
+@app.get("/paper/{paper_id:path}")
 async def get_paper(paper_id: str):
     source_code = retriever.get_source_by_id(paper_id)
     
