@@ -229,6 +229,33 @@ class PaperRetriever:
             logger.warning(f"Upstream request error for paper {paper_id}: {e}")
             return None
 
+    def _get_info_from_upstream(self, paper_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Attempt to get paper metadata from upstream server's /info endpoint.
+        Returns None if upstream not configured, disabled, or request fails.
+        """
+        if not self.upstream_url or not self.upstream_enabled:
+            return None
+
+        try:
+            with httpx.Client(timeout=self.upstream_timeout) as client:
+                response = client.get(f"{self.upstream_url}/paper/{paper_id}/info")
+
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 404:
+                    return None
+                else:
+                    logger.warning(f"Upstream info returned status {response.status_code} for {paper_id}")
+                    return None
+
+        except httpx.TimeoutException:
+            logger.warning(f"Upstream info timeout for paper {paper_id}")
+            return None
+        except httpx.RequestError as e:
+            logger.warning(f"Upstream info request error for paper {paper_id}: {e}")
+            return None
+
     def _resolve_paper_id(self, paper_id: str) -> Tuple[str, Optional[int], bool]:
         """
         Resolve the paper ID to lookup in the database.
@@ -252,6 +279,8 @@ class PaperRetriever:
         """
         Get metadata about a paper without retrieving its content.
 
+        Checks local database first, then upstream server if configured.
+
         Returns dict with:
         - paper_id: The normalized paper ID
         - requested_version: Version requested (if any)
@@ -259,47 +288,54 @@ class PaperRetriever:
         - format: Simplified format category (pdf, source, unknown)
         - size_bytes: File size in bytes
         - year: Publication year
-        - available: Whether the paper is available for retrieval
+        - locally_available: Whether the paper is stored locally
+        - upstream_configured: Whether upstream fallback is available
+        - source: Where the metadata came from ("local" or "upstream")
 
-        Returns None if paper not found.
+        Returns None if paper not found in either location.
         """
         lookup_id, requested_version, version_required = self._resolve_paper_id(paper_id)
 
-        # Try to find the paper
+        # Try to find the paper locally
         metadata = self._lookup_paper_metadata(lookup_id)
 
-        # If versioned lookup failed and version was required, don't fall back
-        if metadata is None and version_required:
-            return None
-
-        # If versioned lookup failed, try base ID
-        if metadata is None:
+        # If versioned lookup failed, try base ID (only if version not required)
+        if metadata is None and not version_required:
             base_id, _ = parse_paper_id(paper_id)
             metadata = self._lookup_paper_metadata(base_id)
 
-        if metadata is None:
-            return None
+        if metadata is not None:
+            # Check if tar file is available locally
+            tar_file_path = os.path.join(self.tar_dir_path, metadata["archive_file"])
+            locally_available = os.path.exists(tar_file_path)
 
-        # Check if tar file is available locally
-        tar_file_path = os.path.join(self.tar_dir_path, metadata["archive_file"])
-        locally_available = os.path.exists(tar_file_path)
+            return {
+                "paper_id": metadata["paper_id"],
+                "requested_version": requested_version,
+                "file_type": metadata["file_type"],
+                "format": metadata["format"],
+                "size_bytes": metadata["size"],
+                "year": metadata["year"],
+                "locally_available": locally_available,
+                "upstream_configured": bool(self.upstream_url and self.upstream_enabled),
+                "source": "local",
+            }
 
-        return {
-            "paper_id": metadata["paper_id"],
-            "requested_version": requested_version,
-            "file_type": metadata["file_type"],
-            "format": metadata["format"],
-            "size_bytes": metadata["size"],
-            "year": metadata["year"],
-            "locally_available": locally_available,
-            "upstream_configured": bool(self.upstream_url and self.upstream_enabled),
-        }
+        # Not found locally - try upstream
+        upstream_info = self._get_info_from_upstream(paper_id)
+        if upstream_info is not None:
+            # Add source indicator and ensure consistent structure
+            upstream_info["source"] = "upstream"
+            upstream_info["locally_available"] = False
+            return upstream_info
+
+        return None
 
     def get_source_by_id(
         self,
         paper_id: str,
         format: Optional[str] = None
-    ) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+    ) -> Dict[str, Any]:
         """
         Get paper source by ID with optional format filtering.
 
@@ -312,24 +348,34 @@ class PaperRetriever:
                 - None: Same as "preferred"
 
         Returns:
-            Tuple of (content, content_type, error_reason):
-            - On success: (bytes, content_type_string, None)
-            - On not found: (None, None, "not_found")
-            - On format mismatch: (None, None, "format_unavailable")
-            - On version mismatch: (None, None, "version_not_found")
+            Dict with:
+            - On success:
+                - content: bytes
+                - content_type: str (e.g., "application/pdf")
+                - error: None
+                - paper_id: str (normalized ID)
+                - file_type: str (pdf, gzip, tar, unknown)
+                - format: str (pdf, source, unknown)
+                - year: int or None
+                - version: int or None (requested version)
+                - source: str ("local", "cache", or "upstream")
+            - On error:
+                - content: None
+                - content_type: None
+                - error: str ("not_found", "format_unavailable", "version_not_found")
         """
         lookup_id, requested_version, version_required = self._resolve_paper_id(paper_id)
+        base_id, _ = parse_paper_id(paper_id)
 
         # Check format filter against metadata first (if we have local metadata)
         metadata = self._lookup_paper_metadata(lookup_id)
 
         # If versioned lookup failed and version was required, return error
         if metadata is None and version_required:
-            return None, None, "version_not_found"
+            return {"content": None, "content_type": None, "error": "version_not_found"}
 
         # If versioned lookup failed, try base ID
         if metadata is None:
-            base_id, _ = parse_paper_id(paper_id)
             lookup_id = base_id
             metadata = self._lookup_paper_metadata(base_id)
 
@@ -337,24 +383,42 @@ class PaperRetriever:
         if metadata is not None and format and format != "preferred":
             paper_format = metadata["format"]
             if format == "pdf" and paper_format != "pdf":
-                return None, None, "format_unavailable"
+                return {"content": None, "content_type": None, "error": "format_unavailable"}
             elif format == "source" and paper_format not in ("source",):
-                return None, None, "format_unavailable"
+                return {"content": None, "content_type": None, "error": "format_unavailable"}
+
+        # Helper to build success response
+        def success_response(content: bytes, source: str, meta: Optional[Dict] = None) -> Dict[str, Any]:
+            content_type = detect_content_type(content)
+            file_type = "pdf" if content_type == "application/pdf" else \
+                        "gzip" if content_type == "application/gzip" else \
+                        "tar" if content_type == "application/x-tar" else "unknown"
+            fmt = "pdf" if file_type == "pdf" else "source" if file_type in ("gzip", "tar") else "unknown"
+
+            return {
+                "content": content,
+                "content_type": content_type,
+                "error": None,
+                "paper_id": meta["paper_id"] if meta else lookup_id,
+                "file_type": meta["file_type"] if meta else file_type,
+                "format": meta["format"] if meta else fmt,
+                "year": meta["year"] if meta else None,
+                "version": requested_version,
+                "source": source,
+            }
 
         # Try cache first (enables offline access when upstream is down)
         if self.cache:
             result = self.cache.get(lookup_id)
             if result is not None:
-                content_type = detect_content_type(result)
-                return result, content_type, None
+                return success_response(result, "cache", metadata)
 
         # Try local storage
         result = self._get_from_local(lookup_id)
         if result is not None:
             if self.cache:
                 self.cache.put(lookup_id, result)
-            content_type = detect_content_type(result)
-            return result, content_type, None
+            return success_response(result, "local", metadata)
 
         # Try upstream if configured
         result = self._get_from_upstream(lookup_id)
@@ -364,14 +428,16 @@ class PaperRetriever:
                 content_type = detect_content_type(result)
                 actual_format = "pdf" if content_type == "application/pdf" else "source"
                 if format != actual_format:
-                    return None, None, "format_unavailable"
+                    return {"content": None, "content_type": None, "error": "format_unavailable"}
 
             if self.cache:
                 self.cache.put(lookup_id, result)
-            content_type = detect_content_type(result)
-            return result, content_type, None
 
-        return None, None, "not_found"
+            # Try to get metadata from upstream for year info
+            upstream_meta = self._get_info_from_upstream(paper_id)
+            return success_response(result, "upstream", upstream_meta)
+
+        return {"content": None, "content_type": None, "error": "not_found"}
     
     def get_detailed_error(self, paper_id: str) -> Tuple[str, str]:
         """

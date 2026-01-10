@@ -259,12 +259,12 @@ async def download_paper(paper_id: str = Form(...)):
         """, status_code=500)
     
     try:
-        content, content_type, error_reason = retriever.get_source_by_id(paper_id)
+        result = retriever.get_source_by_id(paper_id)
 
-        if content is None:
+        if result["content"] is None:
             # Get detailed error information
             error_type, error_message = retriever.get_detailed_error(paper_id)
-            if error_reason == "version_not_found":
+            if result["error"] == "version_not_found":
                 error_type = "version_not_found"
                 error_message = f"Requested version of paper '{paper_id}' not found."
 
@@ -381,6 +381,7 @@ async def download_paper(paper_id: str = Form(...)):
         """, status_code=500)
     
     # Determine the appropriate filename based on content type
+    content_type = result["content_type"]
     if content_type == "application/pdf":
         filename = f"{paper_id}.pdf"
     elif content_type == "application/x-tar":
@@ -389,7 +390,7 @@ async def download_paper(paper_id: str = Form(...)):
         filename = f"{paper_id}.gz"
 
     return Response(
-        content=content,
+        content=result["content"],
         media_type=content_type,
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
@@ -514,6 +515,14 @@ async def get_paper(
       - `application/gzip` for gzip-compressed LaTeX source
       - `application/x-tar` for tar archives
 
+    **Response headers include metadata:**
+    - `X-Paper-ID`: Normalized paper ID
+    - `X-Paper-Format`: Format category (pdf, source, unknown)
+    - `X-Paper-File-Type`: Specific file type (pdf, gzip, tar, unknown)
+    - `X-Paper-Year`: Publication year (if known)
+    - `X-Paper-Version`: Requested version (if specified)
+    - `X-Paper-Source`: Where paper was retrieved from (local, cache, upstream)
+
     **Errors:**
     - `404`: Paper not found, version not found, or requested format unavailable
 
@@ -526,9 +535,10 @@ async def get_paper(
     ```
     """
     format_str = format.value if format else None
-    content, content_type, error_reason = retriever.get_source_by_id(paper_id, format=format_str)
+    result = retriever.get_source_by_id(paper_id, format=format_str)
 
-    if content is None:
+    if result["content"] is None:
+        error_reason = result["error"]
         if error_reason == "version_not_found":
             raise HTTPException(
                 status_code=404,
@@ -545,4 +555,22 @@ async def get_paper(
                 detail=f"Paper with ID '{paper_id}' not found."
             )
 
-    return Response(content=content, media_type=content_type)
+    # Build metadata headers
+    headers = {
+        "X-Paper-ID": result.get("paper_id", ""),
+        "X-Paper-Format": result.get("format", "unknown"),
+        "X-Paper-File-Type": result.get("file_type", "unknown"),
+        "X-Paper-Source": result.get("source", "unknown"),
+    }
+
+    # Only add optional headers if values are present
+    if result.get("year"):
+        headers["X-Paper-Year"] = str(result["year"])
+    if result.get("version"):
+        headers["X-Paper-Version"] = str(result["version"])
+
+    return Response(
+        content=result["content"],
+        media_type=result["content_type"],
+        headers=headers
+    )

@@ -111,6 +111,14 @@ Retrieves raw paper content (PDF or gzipped LaTeX source) by arXiv ID.
   - `application/x-tar` for tar archives
 - Not Found (404): Paper not found, version not found, or format unavailable
 
+**Response headers (metadata):**
+- `X-Paper-ID`: Normalized paper ID
+- `X-Paper-Format`: Format category (pdf, source, unknown)
+- `X-Paper-File-Type`: Specific file type (pdf, gzip, tar, unknown)
+- `X-Paper-Year`: Publication year (if known)
+- `X-Paper-Version`: Requested version (if specified)
+- `X-Paper-Source`: Where paper was retrieved from (local, cache, upstream)
+
 **Example requests:**
 ```bash
 # Get paper (any format)
@@ -128,6 +136,8 @@ curl http://localhost:8000/paper/2103.06497v2 --output paper.pdf
 
 Get metadata about a paper without downloading its content. Use this to check availability and format before downloading.
 
+Checks local database first, then upstream server if configured. This means you can get metadata for papers that are only available upstream.
+
 **Response (JSON):**
 ```json
 {
@@ -138,9 +148,12 @@ Get metadata about a paper without downloading its content. Use this to check av
   "size_bytes": 1234567,
   "year": 2021,
   "locally_available": true,
-  "upstream_configured": true
+  "upstream_configured": true,
+  "source": "local"
 }
 ```
+
+The `source` field indicates where the metadata came from: `"local"` or `"upstream"`.
 
 **Example:**
 ```bash
