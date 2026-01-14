@@ -52,6 +52,13 @@ GET /paper/2103.06497/info
 ```
 Returns JSON with `paper_id`, `file_type`, `format`, `size_bytes`, `year`, `locally_available`, `source`.
 
+### 6. Full-Text Search (Optional)
+When Typesense is configured, search 1.1M+ papers by title, authors, abstract:
+```bash
+GET /search?q=dark+matter+cosmology
+```
+Returns hits with highlights, faceted filters (category, year, file type), and pagination.
+
 ---
 
 ## Project Structure
@@ -64,16 +71,21 @@ paperboy/
 │
 ├── index/                  # Indexing components
 │   ├── arXiv_manifest.sqlite3    # SQLite index database (1.27M+ papers, not committed)
-│   └── index_arxiv_bulk_files.py  # Script to build/update the index
+│   ├── index_arxiv_bulk_files.py  # Script to build/update the index
+│   ├── import_kaggle_metadata.py # Import metadata from Kaggle dataset
+│   └── sync_typesense.py         # Sync SQLite to Typesense search engine
 │
 ├── source/paperboy/        # Main application code
 │   ├── main.py             # FastAPI application (endpoints)
 │   ├── retriever.py        # Paper retrieval logic
+│   ├── search.py           # Typesense search client
 │   ├── cache.py            # LRU disk cache for offline access
 │   └── config.py           # Pydantic settings configuration
 │
+├── docker/                 # Docker configuration
+│   ├── docker-compose.yml  # Docker Compose with Typesense
+│   └── Dockerfile          # Container configuration
 ├── extract_paper.py        # CLI tool to extract individual papers
-├── Dockerfile              # Container deployment
 └── pyproject.toml          # Python dependencies
 ```
 
@@ -105,7 +117,7 @@ cat AI notes/START_HERE.md
 
 ### Database Schema
 
-**`paper_index`** table:
+**`paper_index`** table (core fields from indexing):
 - `paper_id` (TEXT PRIMARY KEY) - arXiv identifier (e.g., "2103.06497")
 - `archive_file` (TEXT) - Relative path to tar archive
 - `offset` (INTEGER) - Byte offset within tar file
@@ -113,15 +125,29 @@ cat AI notes/START_HERE.md
 - `file_type` (TEXT) - Format: pdf/gzip/tar/unknown
 - `year` (INTEGER) - Publication year
 
+**Metadata fields (from Kaggle import):**
+- `categories` (TEXT) - Space-separated categories (e.g., "astro-ph.GA hep-ph")
+- `title` (TEXT) - Paper title
+- `authors` (TEXT) - Author list
+- `abstract` (TEXT) - Paper abstract
+- `doi` (TEXT) - Digital Object Identifier
+- `journal_ref` (TEXT) - Journal reference
+- `comments` (TEXT) - Author comments
+- `versions` (TEXT) - Available versions (e.g., "v1 v2 v3")
+
 ### API Endpoints
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/paper/{paper_id}` | GET | **Primary endpoint** - Retrieve paper by ID |
 | `/paper/{paper_id}/info` | GET | Get paper metadata without downloading |
+| `/paper/random` | GET | Get a random paper from local archives |
+| `/paper/categories` | GET | List available categories (legacy and modern) |
+| `/search` | GET | Full-text search with filters (requires Typesense) |
+| `/search/stats` | GET | Search index statistics |
 | `/health` | GET | Health check for monitoring |
 | `/debug/config` | GET | Debug configuration and cache stats |
-| `/` | GET | HTML search form (for humans) |
+| `/` | GET | HTML search/download interface (for humans) |
 | `/download` | POST | Form submission handler (for humans) |
 
 ### API Reference for AI Agents
@@ -209,6 +235,151 @@ The `source` field indicates where the metadata came from: `"local"` or `"upstre
 curl http://localhost:8000/paper/2103.06497/info
 ```
 
+#### GET /paper/random
+
+Get a random paper from locally available tar files. Useful for sampling, testing, or exploration.
+
+**Query parameters:**
+- `format`: `pdf` or `source` - filter by file type
+- `category`: e.g., `astro-ph`, `hep-lat` - filter by category (old-format papers only)
+- `download`: `true` to return paper content, `false` (default) for metadata only
+
+**Response (metadata mode):**
+```json
+{
+  "paper_id": "1501.02345",
+  "archive_file": "2015/arXiv_src_1501_001.tar",
+  "file_type": "gzip",
+  "format": "source",
+  "size_bytes": 123456,
+  "year": 2015,
+  "locally_available": true
+}
+```
+
+**Examples:**
+```bash
+# Get random paper metadata
+curl http://localhost:8000/paper/random
+
+# Get random PDF metadata
+curl "http://localhost:8000/paper/random?format=pdf"
+
+# Download a random source file
+curl "http://localhost:8000/paper/random?format=source&download=true" -o paper.gz
+```
+
+**Note:** Category filtering only works for old-format papers (pre-2007) where the category is embedded in the paper ID (e.g., `astro-ph0412561`). Modern papers (YYMM.NNNNN format) don't include category in the ID.
+
+#### GET /paper/categories
+
+List available paper categories extracted from old-format paper IDs.
+
+**Response:**
+```json
+{
+  "categories": ["astro-ph", "cond-mat", "hep-lat", "hep-ph", "hep-th", ...],
+  "count": 34
+}
+```
+
+#### GET /search
+
+Full-text search across 1.1M+ papers with faceted filtering. **Requires Typesense to be running and configured.**
+
+**Query parameters:**
+- `q` (required) - Search query string. Supports field-specific searches:
+  - `author:einstein` - search authors field
+  - `title:dark matter` - search title field
+  - `abstract:cosmology` - search abstract field
+  - `category:hep-th` - search categories field
+  - `author:einstein relativity` - combine field + general search
+- `category` - Filter by category (e.g., "astro-ph", "cs.AI")
+- `year_min` - Minimum publication year
+- `year_max` - Maximum publication year
+- `format` - Filter by file type: "pdf" or "source"
+- `page` - Page number (default: 1)
+- `per_page` - Results per page (default: 20, max: 100)
+
+**Response (JSON):**
+```json
+{
+  "query": "dark matter cosmology",
+  "found": 1234,
+  "page": 1,
+  "per_page": 20,
+  "total_pages": 62,
+  "hits": [
+    {
+      "paper_id": "2103.06497",
+      "title": "Dark Matter in the Universe",
+      "authors": "A. Einstein, N. Bohr",
+      "abstract": "We present a comprehensive study...",
+      "categories": ["astro-ph.CO", "hep-ph"],
+      "primary_category": "astro-ph.CO",
+      "year": 2021,
+      "file_type": "pdf",
+      "doi": "10.1234/example",
+      "highlights": {
+        "title": "<mark>Dark Matter</mark> in the Universe",
+        "abstract": "...comprehensive study of <mark>dark matter</mark>..."
+      }
+    }
+  ],
+  "facets": {
+    "primary_category": [{"value": "astro-ph.CO", "count": 500}, ...],
+    "year": [{"value": 2024, "count": 100}, ...],
+    "file_type": [{"value": "pdf", "count": 800}, ...]
+  },
+  "search_time_ms": 12
+}
+```
+
+**Error responses:**
+- Returns `{"error": "Search is not available"}` if Typesense is not configured
+- Returns `{"error": "Search index not found..."}` if collection doesn't exist
+
+**Examples:**
+```bash
+# Basic search
+curl "http://localhost:8000/search?q=neural+networks"
+
+# Field-specific search
+curl "http://localhost:8000/search?q=author:einstein"
+curl "http://localhost:8000/search?q=title:dark+matter"
+
+# Search with category filter
+curl "http://localhost:8000/search?q=galaxy+formation&category=astro-ph"
+
+# Search with year range
+curl "http://localhost:8000/search?q=machine+learning&year_min=2020&year_max=2024"
+
+# Paginated results
+curl "http://localhost:8000/search?q=quantum&page=2&per_page=50"
+```
+
+#### GET /search/stats
+
+Get search index statistics.
+
+**Response (JSON):**
+```json
+{
+  "available": true,
+  "collection": "papers",
+  "num_documents": 1100000,
+  "fields": 10
+}
+```
+
+If Typesense is not available:
+```json
+{
+  "available": false,
+  "error": "Not connected"
+}
+```
+
 #### GET /health
 
 Returns service health status as JSON.
@@ -243,12 +414,27 @@ Via `.env` file or environment variables:
 
 The cache stores papers retrieved from upstream or local archives. When the cache is full, least recently used papers are evicted first (LRU policy).
 
+**Optional - Typesense Search:**
+- `TYPESENSE_ENABLED` - Enable search functionality (default: false)
+- `TYPESENSE_HOST` - Typesense server host (default: localhost)
+- `TYPESENSE_PORT` - Typesense server port (default: 8108)
+- `TYPESENSE_PROTOCOL` - http or https (default: http)
+- `TYPESENSE_API_KEY` - API key for Typesense authentication
+- `TYPESENSE_COLLECTION` - Collection name (default: papers)
+
+To enable search:
+1. Start Typesense: `docker-compose -f docker/docker-compose.yml up -d typesense`
+2. Set `TYPESENSE_ENABLED=true` and `TYPESENSE_API_KEY=your-key`
+3. Sync the database: `python index/sync_typesense.py --db-path $INDEX_DB_PATH --api-key your-key`
+
 ## Key Files to Understand
 
 1. **`source/paperboy/retriever.py`** - Core paper retrieval logic with detailed error handling
 2. **`source/paperboy/main.py`** - FastAPI endpoints (see `/docs` for interactive API docs)
-3. **`source/paperboy/cache.py`** - LRU disk cache for offline paper access
-4. **`index/index_arxiv_bulk_files.py`** - Index building script
+3. **`source/paperboy/search.py`** - Typesense search client with faceting and highlights
+4. **`source/paperboy/cache.py`** - LRU disk cache for offline paper access
+5. **`index/index_arxiv_bulk_files.py`** - Index building script
+6. **`index/sync_typesense.py`** - Sync SQLite to Typesense for full-text search
 
 ## Supported Paper ID Formats
 

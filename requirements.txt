@@ -3,3 +3,6 @@ uvicorn[standard]
 pydantic
 pydantic-settings
 httpx
+jinja2
+python-multipart
+typesense

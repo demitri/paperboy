@@ -1,0 +1,30 @@
+# Run from repo root: docker compose -f docker/docker-compose.yml up -d
+services:
+  paperboy:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: paperboy:latest
+    container_name: paperboy
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - ../.env
+    environment:
+      # These override .env values for container-specific paths
+      - INDEX_DB_PATH=/data/arxiv_index.db
+      - TAR_DIR_PATH=/data/tar_files
+      # Typesense: use host's service via host.docker.internal
+      - TYPESENSE_HOST=host.docker.internal
+    volumes:
+      - /data/paperboy_data/arXiv_manifest.sqlite3:/data/arxiv_index.db:ro
+      - /data/paperboy_data/arXiv:/data/tar_files:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+

@@ -6,7 +6,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from .config import Settings
-from .retriever import PaperRetriever, RetrievalError
+from .retriever import PaperRetriever, RetrievalError, get_expected_tar_pattern
+from .search import SearchClient
 
 
 class PaperFormat(str, Enum):
@@ -19,13 +20,16 @@ class PaperFormat(str, Enum):
 try:
     settings = Settings()
     retriever = PaperRetriever(settings)
+    search_client = SearchClient(settings)
     startup_error = None
 except RetrievalError as e:
     startup_error = str(e)
     retriever = None
+    search_client = None
 except Exception as e:
     startup_error = f"Configuration error: {e}"
     retriever = None
+    search_client = None
 
 app = FastAPI(
     title="Paperboy",
@@ -73,124 +77,688 @@ async def root(request: Request):
     """
     HTML search form for human users.
 
-    **AI agents should use `GET /paper/{paper_id}` instead.**
+    **AI agents should use `GET /paper/{paper_id}` or `GET /search` instead.**
     """
-    return HTMLResponse(content="""
+    search_enabled = search_client.is_available if search_client else False
+    return HTMLResponse(content=f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Paperboy</title>
+    <title>Paperboy - arXiv Paper Search</title>
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 800px;
+        * {{ box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            max-width: 900px;
             margin: 0 auto;
             padding: 20px;
             background-color: #f5f5f5;
-        }
-        .container {
+            color: #333;
+        }}
+        .container {{
             background-color: white;
             padding: 30px;
             border-radius: 8px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 {
+        }}
+        h1 {{
             color: #333;
             text-align: center;
+            margin-bottom: 10px;
+        }}
+        .subtitle {{
+            text-align: center;
+            color: #666;
             margin-bottom: 30px;
-        }
-        .form-group {
+        }}
+        .tabs {{
+            display: flex;
+            border-bottom: 2px solid #ddd;
             margin-bottom: 20px;
-        }
-        label {
-            display: block;
-            margin-bottom: 5px;
-            font-weight: bold;
-            color: #555;
-        }
-        input[type="text"] {
-            width: 100%;
-            padding: 12px;
-            border: 2px solid #ddd;
-            border-radius: 4px;
+        }}
+        .tab {{
+            padding: 12px 24px;
+            cursor: pointer;
+            border: none;
+            background: none;
             font-size: 16px;
-            box-sizing: border-box;
-        }
-        input[type="text"]:focus {
+            color: #666;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+        }}
+        .tab:hover {{ color: #333; }}
+        .tab.active {{
+            color: #4CAF50;
+            border-bottom-color: #4CAF50;
+            font-weight: 600;
+        }}
+        .tab-content {{ display: none; }}
+        .tab-content.active {{ display: block; }}
+        .search-box {{
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }}
+        .search-box input {{
+            flex: 1;
+            padding: 14px 16px;
+            border: 2px solid #ddd;
+            border-radius: 6px;
+            font-size: 16px;
+        }}
+        .search-box input:focus {{
             border-color: #4CAF50;
             outline: none;
-        }
-        button {
+        }}
+        .search-box button {{
+            padding: 14px 28px;
             background-color: #4CAF50;
             color: white;
-            padding: 12px 24px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+        }}
+        .search-box button:hover {{ background-color: #45a049; }}
+        .search-box button:disabled {{ background-color: #9e9e9e; cursor: not-allowed; }}
+        .filters {{
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }}
+        .filter-group {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .filter-group label {{
+            font-size: 14px;
+            color: #666;
+        }}
+        .filter-group select, .filter-group input {{
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }}
+        .results-info {{
+            padding: 10px 0;
+            color: #666;
+            font-size: 14px;
+            border-bottom: 1px solid #eee;
+            margin-bottom: 15px;
+        }}
+        .result-card {{
+            padding: 20px;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            transition: box-shadow 0.2s;
+        }}
+        .result-card:hover {{
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }}
+        .result-title {{
+            font-size: 18px;
+            font-weight: 600;
+            color: #1a0dab;
+            margin-bottom: 8px;
+            cursor: pointer;
+        }}
+        .result-title:hover {{ text-decoration: underline; }}
+        .result-meta {{
+            font-size: 13px;
+            color: #666;
+            margin-bottom: 10px;
+        }}
+        .result-meta span {{
+            margin-right: 15px;
+        }}
+        .result-abstract {{
+            font-size: 14px;
+            color: #444;
+            line-height: 1.5;
+            cursor: pointer;
+        }}
+        .result-abstract:hover {{
+            background-color: #f9f9f9;
+        }}
+        .result-abstract.expanded {{
+            background-color: #fafafa;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 5px 0;
+        }}
+        .abstract-hint {{
+            font-size: 12px;
+            color: #999;
+            font-style: italic;
+        }}
+        .result-categories {{
+            margin-top: 10px;
+        }}
+        .category-tag {{
+            display: inline-block;
+            padding: 3px 8px;
+            background-color: #e8f5e9;
+            color: #2e7d32;
+            border-radius: 4px;
+            font-size: 12px;
+            margin-right: 5px;
+            margin-top: 5px;
+        }}
+        .download-btn {{
+            display: inline-block;
+            padding: 8px 16px;
+            background-color: #4CAF50;
+            color: white;
             border: none;
             border-radius: 4px;
             cursor: pointer;
-            font-size: 16px;
-            width: 100%;
-        }
-        button:hover {
-            background-color: #45a049;
-        }
-        .info {
-            background-color: #e7f3ff;
-            border: 1px solid #b3d7ff;
-            border-radius: 4px;
-            padding: 15px;
-            margin-bottom: 20px;
-        }
-        .examples {
-            background-color: #f9f9f9;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            padding: 15px;
+            font-size: 13px;
+            margin-top: 10px;
+        }}
+        .download-btn:hover {{ background-color: #45a049; }}
+        mark {{
+            background-color: #fff59d;
+            padding: 0 2px;
+        }}
+        .pagination {{
+            display: flex;
+            justify-content: center;
+            gap: 10px;
             margin-top: 20px;
-        }
-        .examples h3 {
-            margin-top: 0;
-            color: #555;
-        }
-        .examples code {
-            background-color: #f0f0f0;
-            padding: 2px 4px;
-            border-radius: 2px;
+        }}
+        .pagination button {{
+            padding: 8px 16px;
+            border: 1px solid #ddd;
+            background: white;
+            border-radius: 4px;
+            cursor: pointer;
+        }}
+        .pagination button:hover {{ background-color: #f5f5f5; }}
+        .pagination button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+        .pagination .current {{ background-color: #4CAF50; color: white; border-color: #4CAF50; }}
+        .error {{
+            color: #d32f2f;
+            background-color: #ffebee;
+            padding: 15px;
+            border-radius: 4px;
+            border-left: 4px solid #d32f2f;
+        }}
+        .success {{
+            color: #2e7d32;
+            background-color: #e8f5e9;
+            padding: 15px;
+            border-radius: 4px;
+            border-left: 4px solid #4CAF50;
+        }}
+        .loading {{
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #ffffff;
+            border-radius: 50%;
+            border-top-color: transparent;
+            animation: spin 1s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }}
+        @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+        .no-search {{
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }}
+        .hint {{
+            background-color: #e3f2fd;
+            border: 1px solid #90caf9;
+            border-radius: 4px;
+            padding: 15px;
+            margin-top: 15px;
+        }}
+        .hint-title {{
+            font-weight: bold;
+            color: #1565c0;
+            margin-bottom: 10px;
+        }}
+        .hint ul {{ margin: 10px 0; padding-left: 20px; }}
+        .hint code {{
+            background-color: #e8e8e8;
+            padding: 2px 6px;
+            border-radius: 3px;
             font-family: monospace;
-        }
+        }}
+        #searchResults, #downloadResult {{ margin-top: 20px; }}
+        .keyboard-hint {{
+            font-size: 12px;
+            color: #999;
+            text-align: center;
+            margin-top: 15px;
+        }}
+        .search-syntax-hint {{
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 15px;
+            min-height: 20px;
+        }}
+        .search-syntax-hint code {{
+            background-color: #f0f0f0;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: monospace;
+            margin-right: 8px;
+        }}
+        .category-suggestions {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+        }}
+        .category-suggestions span {{
+            background-color: #e8f5e9;
+            color: #2e7d32;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 11px;
+            cursor: pointer;
+        }}
+        .category-suggestions span:hover {{
+            background-color: #c8e6c9;
+        }}
+        kbd {{
+            background-color: #f0f0f0;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            padding: 2px 6px;
+            font-family: monospace;
+            font-size: 11px;
+        }}
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Paperboy</h1>
-        
-        <div class="info">
-            <strong>Note:</strong> This service extracts LaTeX source code and PDF files from arXiv papers. 
-            Enter a valid arXiv paper ID below to download the corresponding file.
-        </div>
-        
-        <form action="/download" method="post">
-            <div class="form-group">
-                <label for="paper_id">arXiv Paper ID:</label>
-                <input type="text" id="paper_id" name="paper_id"
-                       placeholder="e.g., arXiv:1501.00963v3, 2103.06497, astro-ph/9205002"
-                       required>
-            </div>
-            <button type="submit">Download Paper</button>
-        </form>
+        <p class="subtitle">Search and download arXiv papers</p>
 
-        <div class="examples">
-            <h3>Accepted Formats:</h3>
-            <ul>
-                <li><code>arXiv:1501.00963v3</code> - With prefix and version</li>
-                <li><code>1501.00963</code> - Just the ID</li>
-                <li><code>astro-ph/0412561</code> - Old format with slash</li>
-                <li><code>astro-ph0412561</code> - Old format without slash</li>
-                <li><code>https://arxiv.org/abs/1501.00963</code> - Full URL</li>
-            </ul>
+        <div class="tabs">
+            <button class="tab active" data-tab="search">Search Papers</button>
+            <button class="tab" data-tab="download">Download by ID</button>
+        </div>
+
+        <!-- Search Tab -->
+        <div id="searchTab" class="tab-content active">
+            {'<div class="no-search"><p>Search is not available.</p><p>Typesense is not configured or running.</p></div>' if not search_enabled else '''
+            <form id="searchForm">
+                <div class="search-box">
+                    <input type="text" id="searchQuery" placeholder="Search papers... (try author:name or title:words)" autofocus>
+                    <button type="submit" id="searchBtn">Search</button>
+                </div>
+                <div class="search-syntax-hint">
+                    Field search: <code>author:einstein</code> <code>title:relativity</code> <code>abstract:quantum</code> <code>category:hep-th</code>
+                </div>
+                <div class="filters">
+                    <div class="filter-group">
+                        <label for="categoryFilter">Category:</label>
+                        <select id="categoryFilter">
+                            <option value="">All</option>
+                        </select>
+                    </div>
+                    <div class="filter-group">
+                        <label for="yearMin">Year:</label>
+                        <input type="number" id="yearMin" placeholder="From" style="width: 80px;">
+                        <span>-</span>
+                        <input type="number" id="yearMax" placeholder="To" style="width: 80px;">
+                    </div>
+                    <div class="filter-group">
+                        <label for="formatFilter">Format:</label>
+                        <select id="formatFilter">
+                            <option value="">All</option>
+                            <option value="pdf">PDF</option>
+                            <option value="source">Source</option>
+                        </select>
+                    </div>
+                </div>
+            </form>
+            <div id="searchResults"></div>
+            <p class="keyboard-hint">Tip: Press <kbd>/</kbd> anywhere to jump to search box</p>
+            '''}
+        </div>
+
+        <!-- Download Tab -->
+        <div id="downloadTab" class="tab-content">
+            <form id="downloadForm">
+                <div class="search-box">
+                    <input type="text" id="paper_id" placeholder="e.g., 2103.06497, arXiv:1501.00963v3, astro-ph/0412561">
+                    <button type="submit" id="downloadBtn">Download</button>
+                </div>
+            </form>
+            <div id="downloadResult"></div>
+            <div class="hint" style="margin-top: 20px;">
+                <div class="hint-title">Accepted ID Formats</div>
+                <ul>
+                    <li><code>2103.06497</code> - Modern arXiv ID</li>
+                    <li><code>arXiv:1501.00963v3</code> - With prefix and version</li>
+                    <li><code>astro-ph/0412561</code> - Old format with category</li>
+                    <li><code>https://arxiv.org/abs/1501.00963</code> - Full URL</li>
+                </ul>
+            </div>
         </div>
     </div>
+
+    <script>
+        // Tab switching
+        document.querySelectorAll('.tab').forEach(tab => {{
+            tab.addEventListener('click', () => {{
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                document.getElementById(tab.dataset.tab + 'Tab').classList.add('active');
+            }});
+        }});
+
+        // Keyboard shortcut
+        document.addEventListener('keydown', (e) => {{
+            if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {{
+                e.preventDefault();
+                const searchInput = document.getElementById('searchQuery');
+                if (searchInput) searchInput.focus();
+            }}
+        }});
+
+        // Load categories for filter and autocomplete
+        let allCategories = [];
+        const defaultHint = 'Field search: <code>author:einstein</code> <code>title:relativity</code> <code>abstract:quantum</code> <code>category:hep-th</code>';
+
+        async function loadCategories() {{
+            try {{
+                const resp = await fetch('/paper/categories');
+                const data = await resp.json();
+                const select = document.getElementById('categoryFilter');
+                if (data.all_categories) {{
+                    allCategories = data.all_categories;
+                    if (select) {{
+                        allCategories.slice(0, 50).forEach(cat => {{
+                            const opt = document.createElement('option');
+                            opt.value = cat;
+                            opt.textContent = cat;
+                            select.appendChild(opt);
+                        }});
+                    }}
+                }}
+            }} catch(e) {{ console.log('Could not load categories'); }}
+        }}
+        loadCategories();
+
+        // Category autocomplete in search box
+        function updateCategoryHint() {{
+            const input = document.getElementById('searchQuery');
+            const hintDiv = document.querySelector('.search-syntax-hint');
+            if (!input || !hintDiv) return;
+
+            const value = input.value;
+            // Check if user is typing a category: field
+            const catMatch = value.match(/category:(\S*)$/i) || value.match(/cat:(\S*)$/i);
+
+            if (catMatch) {{
+                const partial = catMatch[1].toLowerCase();
+                const matches = allCategories.filter(c => c.toLowerCase().startsWith(partial)).slice(0, 30);
+
+                if (matches.length > 0) {{
+                    hintDiv.innerHTML = '<div class="category-suggestions">' +
+                        matches.map(c => `<span onclick="insertCategory('${{c}}')">${{c}}</span>`).join('') +
+                        '</div>';
+                    return;
+                }}
+            }}
+
+            // Restore default hint
+            if (hintDiv.innerHTML !== defaultHint) {{
+                hintDiv.innerHTML = defaultHint;
+            }}
+        }}
+
+        function insertCategory(cat) {{
+            const input = document.getElementById('searchQuery');
+            if (!input) return;
+            // Replace the partial category with the full one
+            input.value = input.value.replace(/category:\S*$/i, 'category:' + cat + ' ').replace(/cat:\S*$/i, 'category:' + cat + ' ');
+            input.focus();
+            updateCategoryHint();
+            // Trigger search
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(() => {{ currentPage = 1; doSearch(); }}, 300);
+        }}
+
+        // Search functionality
+        let currentPage = 1;
+        let searchTimeout = null;
+        const searchForm = document.getElementById('searchForm');
+        const searchInput = document.getElementById('searchQuery');
+
+        if (searchForm) {{
+            searchForm.addEventListener('submit', (e) => {{
+                e.preventDefault();
+                currentPage = 1;
+                doSearch();
+            }});
+        }}
+
+        // Live search with debouncing
+        if (searchInput) {{
+            searchInput.addEventListener('input', () => {{
+                updateCategoryHint();
+                clearTimeout(searchTimeout);
+                const query = searchInput.value.trim();
+                if (query.length >= 2) {{
+                    searchTimeout = setTimeout(() => {{
+                        currentPage = 1;
+                        doSearch();
+                    }}, 300);
+                }}
+            }});
+        }}
+
+        async function doSearch(page = 1) {{
+            const query = document.getElementById('searchQuery').value.trim();
+            if (!query) return;
+
+            const category = document.getElementById('categoryFilter').value;
+            const yearMin = document.getElementById('yearMin').value;
+            const yearMax = document.getElementById('yearMax').value;
+            const format = document.getElementById('formatFilter').value;
+
+            const searchBtn = document.getElementById('searchBtn');
+            const resultsDiv = document.getElementById('searchResults');
+
+            searchBtn.disabled = true;
+            searchBtn.innerHTML = '<span class="loading"></span>Searching...';
+
+            let url = `/search?q=${{encodeURIComponent(query)}}&page=${{page}}&per_page=20`;
+            if (category) url += `&category=${{encodeURIComponent(category)}}`;
+            if (yearMin) url += `&year_min=${{yearMin}}`;
+            if (yearMax) url += `&year_max=${{yearMax}}`;
+            if (format) url += `&format=${{format}}`;
+
+            try {{
+                const resp = await fetch(url);
+                const data = await resp.json();
+
+                if (data.error) {{
+                    resultsDiv.innerHTML = `<div class="error">${{data.error}}</div>`;
+                }} else {{
+                    renderResults(data);
+                }}
+            }} catch(e) {{
+                resultsDiv.innerHTML = `<div class="error">Search failed: ${{e.message}}</div>`;
+            }} finally {{
+                searchBtn.disabled = false;
+                searchBtn.textContent = 'Search';
+            }}
+        }}
+
+        function renderResults(data) {{
+            const resultsDiv = document.getElementById('searchResults');
+
+            if (data.found === 0) {{
+                resultsDiv.innerHTML = '<div class="no-search"><p>No papers found matching your query.</p></div>';
+                return;
+            }}
+
+            let html = `<div class="results-info">Found ${{data.found.toLocaleString()}} papers (${{data.search_time_ms || 0}}ms)</div>`;
+
+            data.hits.forEach((hit, index) => {{
+                const title = hit.highlights.title || hit.title;
+                const fullAbstract = hit.abstract || '';
+                const highlightedAbstract = hit.highlights.abstract || '';
+                const truncatedAbstract = highlightedAbstract || (fullAbstract.length > 300 ? fullAbstract.substring(0, 300) + '...' : fullAbstract);
+                const categories = hit.categories || [];
+                const needsExpand = fullAbstract.length > 300;
+
+                html += `
+                    <div class="result-card">
+                        <div class="result-title" onclick="downloadPaper('${{hit.paper_id}}')">${{title}}</div>
+                        <div class="result-meta">
+                            <span><strong>${{hit.paper_id}}</strong></span>
+                            <span>${{hit.authors ? hit.authors.substring(0, 100) : ''}}</span>
+                            <span>${{hit.year || ''}}</span>
+                            <span>${{hit.file_type || ''}}</span>
+                        </div>
+                        <div class="result-abstract"
+                             id="abstract-${{index}}"
+                             data-full="${{fullAbstract.replace(/"/g, '&quot;')}}"
+                             data-truncated="${{truncatedAbstract.replace(/"/g, '&quot;')}}"
+                             data-expanded="false"
+                             onclick="toggleAbstract(${{index}})">${{truncatedAbstract}}${{needsExpand ? ' <span class="abstract-hint">(click to expand)</span>' : ''}}</div>
+                        <div class="result-categories">
+                            ${{categories.map(c => `<span class="category-tag">${{c}}</span>`).join('')}}
+                        </div>
+                        <button class="download-btn" onclick="downloadPaper('${{hit.paper_id}}')">Download</button>
+                    </div>
+                `;
+            }});
+
+            // Pagination
+            if (data.total_pages > 1) {{
+                html += '<div class="pagination">';
+                html += `<button ${{data.page <= 1 ? 'disabled' : ''}} onclick="doSearch(${{data.page - 1}})">Previous</button>`;
+                html += `<button class="current">Page ${{data.page}} of ${{data.total_pages}}</button>`;
+                html += `<button ${{data.page >= data.total_pages ? 'disabled' : ''}} onclick="doSearch(${{data.page + 1}})">Next</button>`;
+                html += '</div>';
+            }}
+
+            resultsDiv.innerHTML = html;
+        }}
+
+        // Toggle abstract expand/collapse
+        function toggleAbstract(index) {{
+            const el = document.getElementById('abstract-' + index);
+            if (!el) return;
+            const isExpanded = el.dataset.expanded === 'true';
+            if (isExpanded) {{
+                el.innerHTML = el.dataset.truncated + ' <span class="abstract-hint">(click to expand)</span>';
+                el.dataset.expanded = 'false';
+                el.classList.remove('expanded');
+            }} else {{
+                el.innerHTML = el.dataset.full + ' <span class="abstract-hint">(click to collapse)</span>';
+                el.dataset.expanded = 'true';
+                el.classList.add('expanded');
+            }}
+        }}
+
+        // Download functionality
+        async function downloadPaper(paperId) {{
+            try {{
+                const response = await fetch(`/paper/${{encodeURIComponent(paperId)}}`);
+                if (response.ok) {{
+                    const blob = await response.blob();
+                    const contentType = response.headers.get('content-type');
+                    let ext = '.pdf';
+                    if (contentType === 'application/gzip') ext = '.gz';
+                    else if (contentType === 'application/x-tar') ext = '.tar';
+
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = paperId.replace(/[^a-zA-Z0-9.-]/g, '_') + ext;
+                    document.body.appendChild(a);
+                    a.click();
+                    window.URL.revokeObjectURL(url);
+                    a.remove();
+                }} else {{
+                    alert('Failed to download paper');
+                }}
+            }} catch(e) {{
+                alert('Download error: ' + e.message);
+            }}
+        }}
+
+        // Download by ID form
+        const downloadForm = document.getElementById('downloadForm');
+        downloadForm.addEventListener('submit', async (e) => {{
+            e.preventDefault();
+            const paperId = document.getElementById('paper_id').value.trim();
+            if (!paperId) return;
+
+            const btn = document.getElementById('downloadBtn');
+            const resultDiv = document.getElementById('downloadResult');
+
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading"></span>Fetching...';
+
+            try {{
+                const response = await fetch(`/paper/${{encodeURIComponent(paperId)}}`);
+                if (response.ok) {{
+                    const blob = await response.blob();
+                    const contentType = response.headers.get('content-type');
+                    const source = response.headers.get('x-paper-source') || 'unknown';
+
+                    let ext = '.pdf';
+                    if (contentType === 'application/gzip') ext = '.gz';
+                    else if (contentType === 'application/x-tar') ext = '.tar';
+
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = paperId.replace(/[^a-zA-Z0-9.-]/g, '_') + ext;
+                    document.body.appendChild(a);
+                    a.click();
+                    window.URL.revokeObjectURL(url);
+                    a.remove();
+
+                    resultDiv.innerHTML = `<div class="success"><strong>Download started!</strong><br>Paper retrieved from: <code>${{source}}</code></div>`;
+                }} else {{
+                    const errorData = await response.json();
+                    const detail = errorData.detail || {{}};
+                    const message = detail.message || errorData.detail || 'Unknown error';
+                    const tarHint = detail.tar_hint;
+
+                    let hintHtml = '';
+                    if (tarHint) {{
+                        hintHtml = `
+                            <div class="hint">
+                                <div class="hint-title">Expected Tar File Location</div>
+                                <ul>
+                                    <li><strong>Directory:</strong> <code>${{tarHint.year_dir}}/</code></li>
+                                    <li><strong>PDF:</strong> <code>${{tarHint.pdf_pattern}}</code></li>
+                                    <li><strong>Source:</strong> <code>${{tarHint.src_pattern}}</code></li>
+                                </ul>
+                            </div>
+                        `;
+                    }}
+                    resultDiv.innerHTML = `<div class="error">${{message}}</div>${{hintHtml}}`;
+                }}
+            }} catch(e) {{
+                resultDiv.innerHTML = `<div class="error">Network error: ${{e.message}}</div>`;
+            }} finally {{
+                btn.disabled = false;
+                btn.textContent = 'Download';
+            }}
+        }});
+    </script>
 </body>
 </html>
     """)
@@ -263,10 +831,43 @@ async def download_paper(paper_id: str = Form(...)):
 
         if result["content"] is None:
             # Get detailed error information
-            error_type, error_message = retriever.get_detailed_error(paper_id)
+            error_info = retriever.get_detailed_error(paper_id)
+            error_type = error_info["error_type"]
+            error_message = error_info["error_message"]
+            tar_hint = error_info.get("tar_hint")
+
             if result["error"] == "version_not_found":
                 error_type = "version_not_found"
                 error_message = f"Requested version of paper '{paper_id}' not found."
+                # Always get tar hint for version errors (base paper may exist but tar_hint would be None)
+                tar_hint = get_expected_tar_pattern(paper_id)
+
+            # Build tar hint HTML if available
+            tar_hint_html = ""
+            if tar_hint:
+                tar_hint_html = f"""
+        <div class="hint">
+            <div class="hint-title">Expected Tar File Location</div>
+            <p>This paper should be in one of the following arXiv bulk tar files:</p>
+            <ul>
+                <li><strong>Directory:</strong> <code>{tar_hint['year_dir']}/</code></li>
+                <li><strong>PDF files:</strong> <code>{tar_hint['pdf_pattern']}</code></li>
+                <li><strong>Source files:</strong> <code>{tar_hint['src_pattern']}</code></li>
+            </ul>
+            <p class="hint-note">Download bulk data from <a href="https://info.arxiv.org/help/bulk_data.html" target="_blank">arXiv Bulk Data Access</a></p>
+        </div>
+"""
+            # Show exact archive file if known (archive_missing case)
+            archive_file = error_info.get("archive_file")
+            if archive_file:
+                tar_hint_html = f"""
+        <div class="hint">
+            <div class="hint-title">Required Tar File</div>
+            <p>This paper requires the following tar file:</p>
+            <p><code>{archive_file}</code></p>
+            <p class="hint-note">Download bulk data from <a href="https://info.arxiv.org/help/bulk_data.html" target="_blank">arXiv Bulk Data Access</a></p>
+        </div>
+"""
 
             return HTMLResponse(content=f"""
 <!DOCTYPE html>
@@ -305,12 +906,43 @@ async def download_paper(paper_id: str = Form(...)):
             margin-bottom: 10px;
             text-transform: capitalize;
         }}
+        .hint {{
+            background-color: #e3f2fd;
+            border: 1px solid #90caf9;
+            border-radius: 4px;
+            padding: 15px;
+            margin-top: 20px;
+            text-align: left;
+        }}
+        .hint-title {{
+            font-weight: bold;
+            color: #1565c0;
+            margin-bottom: 10px;
+        }}
+        .hint ul {{
+            margin: 10px 0;
+            padding-left: 20px;
+        }}
+        .hint code {{
+            background-color: #e8e8e8;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: monospace;
+        }}
+        .hint-note {{
+            font-size: 0.9em;
+            color: #666;
+            margin-top: 10px;
+        }}
         a {{
             color: #4CAF50;
             text-decoration: none;
         }}
         a:hover {{
             text-decoration: underline;
+        }}
+        .hint a {{
+            color: #1565c0;
         }}
     </style>
 </head>
@@ -321,6 +953,7 @@ async def download_paper(paper_id: str = Form(...)):
             <div class="error-type">{error_type.replace('_', ' ').title()}</div>
             {error_message}
         </div>
+        {tar_hint_html}
         <p><a href="/">← Back to search</a></p>
     </div>
 </body>
@@ -407,6 +1040,8 @@ async def health():
     - `upstream_configured`: Whether an upstream fallback server is configured
     - `upstream_enabled`: Whether upstream fallback is enabled
     - `cache_configured`: Whether paper caching is enabled
+    - `arxiv_fallback_enabled`: Whether direct arXiv.org fallback is enabled
+    - `search_available`: Whether Typesense search is available
     """
     import os
     return {
@@ -415,6 +1050,8 @@ async def health():
         "upstream_configured": bool(settings.UPSTREAM_SERVER_URL),
         "upstream_enabled": settings.UPSTREAM_ENABLED,
         "cache_configured": bool(settings.CACHE_DIR_PATH),
+        "arxiv_fallback_enabled": settings.ARXIV_FALLBACK_ENABLED,
+        "search_available": search_client.is_available if search_client else False,
     }
 
 
@@ -427,6 +1064,7 @@ async def debug_config():
     - All configuration paths and settings
     - Whether required files/directories exist
     - Cache statistics (if caching enabled): size, utilization, paper count
+    - Search statistics (if Typesense enabled): document count
     """
     import os
     config = {
@@ -437,6 +1075,11 @@ async def debug_config():
         "UPSTREAM_ENABLED": settings.UPSTREAM_ENABLED,
         "CACHE_DIR_PATH": settings.CACHE_DIR_PATH,
         "CACHE_MAX_SIZE_GB": settings.CACHE_MAX_SIZE_GB,
+        "ARXIV_FALLBACK_ENABLED": settings.ARXIV_FALLBACK_ENABLED,
+        "ARXIV_TIMEOUT": settings.ARXIV_TIMEOUT,
+        "TYPESENSE_HOST": settings.TYPESENSE_HOST,
+        "TYPESENSE_PORT": settings.TYPESENSE_PORT,
+        "TYPESENSE_ENABLED": settings.TYPESENSE_ENABLED,
         "db_exists": os.path.exists(settings.INDEX_DB_PATH),
         "tar_dir_exists": os.path.exists(settings.TAR_DIR_PATH),
         "working_directory": os.getcwd()
@@ -446,7 +1089,249 @@ async def debug_config():
     if retriever and retriever.cache:
         config["cache_stats"] = retriever.cache.get_stats()
 
+    # Add search stats if search is configured
+    if search_client:
+        config["search_stats"] = search_client.get_stats()
+
     return config
+
+
+@app.get("/paper/random", tags=["Paper Retrieval"])
+async def get_random_paper(
+    format: Optional[PaperFormat] = Query(
+        default=None,
+        description="Filter by format: 'pdf' or 'source'"
+    ),
+    category: Optional[str] = Query(
+        default=None,
+        description="Filter by category (e.g., 'astro-ph', 'hep-lat', 'cond-mat'). Only applies to old-format papers currently."
+    ),
+    download: bool = Query(
+        default=False,
+        description="If true, return the paper content. If false, return metadata only."
+    ),
+    local_only: bool = Query(
+        default=True,
+        description="If true (default), only select from locally available papers. If false, select from entire database (paper fetched via upstream/arXiv)."
+    )
+):
+    """
+    Get a random paper from the database.
+
+    **Query parameters:**
+    - `format`: Filter by format - 'pdf' or 'source' (gzip/tar)
+    - `category`: Filter by arXiv category (e.g., 'astro-ph', 'hep-lat'). Only works for old-format papers.
+    - `download`: If true, returns the paper content. If false (default), returns metadata.
+    - `local_only`: If true (default), only select from local tar files. If false, select from entire database.
+
+    **Example requests:**
+    ```
+    GET /paper/random                        # Random local paper metadata
+    GET /paper/random?local_only=false       # Random paper from entire database
+    GET /paper/random?format=pdf             # Random PDF paper metadata
+    GET /paper/random?category=astro-ph      # Random astrophysics paper (old-format)
+    GET /paper/random?download=true          # Download a random paper
+    GET /paper/random?local_only=false&download=true  # Download random paper (via upstream/arXiv)
+    ```
+
+    **Metadata response:**
+    ```json
+    {
+      "paper_id": "astro-ph0412561",
+      "file_type": "gzip",
+      "format": "source",
+      "size_bytes": 123456,
+      "year": 2004,
+      "locally_available": true
+    }
+    ```
+    """
+    if not retriever:
+        raise HTTPException(status_code=500, detail="Service not configured")
+
+    format_str = format.value if format else None
+
+    # Get random paper metadata
+    paper_info = retriever.get_random_paper(format=format_str, category=category, local_only=local_only)
+
+    if paper_info is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "No papers found matching the criteria.",
+                "error": "no_matches",
+                "format": format_str,
+                "category": category,
+            }
+        )
+
+    if not download:
+        return paper_info
+
+    # Download the paper
+    result = retriever.get_source_by_id(paper_info["paper_id"], format=format_str)
+
+    if result["content"] is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Paper {paper_info['paper_id']} not found."
+        )
+
+    # Build metadata headers
+    headers = {
+        "X-Paper-ID": result.get("paper_id", ""),
+        "X-Paper-Format": result.get("format", "unknown"),
+        "X-Paper-File-Type": result.get("file_type", "unknown"),
+        "X-Paper-Source": result.get("source", "unknown"),
+    }
+    if result.get("year"):
+        headers["X-Paper-Year"] = str(result["year"])
+
+    return Response(
+        content=result["content"],
+        media_type=result["content_type"],
+        headers=headers
+    )
+
+
+@app.get("/paper/categories", tags=["Paper Retrieval"])
+async def get_categories():
+    """
+    Get list of available paper categories.
+
+    Returns categories that can be used with `/paper/random?category=`.
+
+    **Response fields:**
+    - `legacy_categories`: From old-format paper IDs (e.g., 'astro-ph', 'hep-lat')
+    - `modern_categories`: From categories column (e.g., 'astro-ph.GA', 'cs.AI')
+    - `all_categories`: Combined list of all category prefixes
+
+    **Note:** Modern categories require running the `fetch_categories.py` script
+    to populate the categories column from the arXiv API.
+    """
+    if not retriever:
+        raise HTTPException(status_code=500, detail="Service not configured")
+
+    result = retriever.get_available_categories()
+    return {
+        "legacy_categories": result["legacy_categories"],
+        "modern_categories": result["modern_categories"],
+        "all_categories": result["all_categories"],
+        "legacy_count": len(result["legacy_categories"]),
+        "modern_count": len(result["modern_categories"]),
+        "total_count": len(result["all_categories"]),
+    }
+
+
+@app.get("/search", tags=["Search"])
+async def search_papers(
+    q: str = Query(..., description="Search query", min_length=1),
+    category: Optional[str] = Query(None, description="Filter by category (e.g., 'astro-ph', 'cs.AI')"),
+    year_min: Optional[int] = Query(None, description="Minimum year", ge=1990, le=2030),
+    year_max: Optional[int] = Query(None, description="Maximum year", ge=1990, le=2030),
+    format: Optional[str] = Query(None, description="Filter by format: 'pdf' or 'source'"),
+    page: int = Query(1, description="Page number", ge=1),
+    per_page: int = Query(20, description="Results per page", ge=1, le=100),
+):
+    """
+    Full-text search for papers by title, authors, abstract, or categories.
+
+    **This is the primary search endpoint for finding papers.**
+
+    **Query parameters:**
+    - `q` (required): Search query - searches title, authors, abstract, categories
+    - `category`: Filter by arXiv category (e.g., 'astro-ph', 'cs.AI', 'hep-th')
+    - `year_min`, `year_max`: Filter by publication year range
+    - `format`: Filter by file type ('pdf' or 'source')
+    - `page`: Page number (default: 1)
+    - `per_page`: Results per page (default: 20, max: 100)
+
+    **Response:**
+    ```json
+    {
+      "query": "dark matter",
+      "found": 12345,
+      "page": 1,
+      "per_page": 20,
+      "total_pages": 618,
+      "hits": [
+        {
+          "paper_id": "2103.06497",
+          "title": "Dark Matter Studies",
+          "authors": "A. Einstein, N. Bohr",
+          "abstract": "We present...",
+          "categories": ["astro-ph.CO", "hep-ph"],
+          "year": 2021,
+          "file_type": "pdf",
+          "highlights": {
+            "title": "<mark>Dark Matter</mark> Studies"
+          }
+        }
+      ],
+      "facets": {
+        "primary_category": [{"value": "astro-ph.CO", "count": 500}],
+        "year": [{"value": 2024, "count": 100}]
+      }
+    }
+    ```
+
+    **Examples:**
+    ```
+    GET /search?q=machine+learning
+    GET /search?q=gravitational+waves&category=gr-qc
+    GET /search?q=neural+network&year_min=2020&format=pdf
+    GET /search?q=cosmology&page=2&per_page=50
+    ```
+    """
+    if not search_client or not search_client.is_available:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "search_unavailable",
+                "message": "Search service is not available. Typesense may not be configured or running."
+            }
+        )
+
+    result = search_client.search(
+        query=q,
+        category=category,
+        year_min=year_min,
+        year_max=year_max,
+        file_type=format,
+        page=page,
+        per_page=per_page,
+    )
+
+    if "error" in result:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "search_error",
+                "message": result["error"]
+            }
+        )
+
+    return result
+
+
+@app.get("/search/stats", tags=["Search"])
+async def search_stats():
+    """
+    Get search index statistics.
+
+    **Response:**
+    ```json
+    {
+      "available": true,
+      "collection": "papers",
+      "num_documents": 1098246
+    }
+    ```
+    """
+    if not search_client:
+        return {"available": False, "error": "Search not configured"}
+
+    return search_client.get_stats()
 
 
 @app.get("/paper/{paper_id:path}/info", tags=["Paper Retrieval"])
@@ -474,9 +1359,14 @@ async def get_paper_info(paper_id: str):
     info = retriever.get_paper_info(paper_id)
 
     if info is None:
+        tar_hint = get_expected_tar_pattern(paper_id)
         raise HTTPException(
             status_code=404,
-            detail=f"Paper with ID '{paper_id}' not found."
+            detail={
+                "message": f"Paper with ID '{paper_id}' not found.",
+                "error": "not_found",
+                "tar_hint": tar_hint,
+            }
         )
 
     return info
@@ -539,20 +1429,34 @@ async def get_paper(
 
     if result["content"] is None:
         error_reason = result["error"]
+        tar_hint = get_expected_tar_pattern(paper_id)
+
         if error_reason == "version_not_found":
             raise HTTPException(
                 status_code=404,
-                detail=f"Requested version of paper '{paper_id}' not found."
+                detail={
+                    "message": f"Requested version of paper '{paper_id}' not found.",
+                    "error": "version_not_found",
+                    "tar_hint": tar_hint,
+                }
             )
         elif error_reason == "format_unavailable":
             raise HTTPException(
                 status_code=404,
-                detail=f"Paper '{paper_id}' is not available in '{format_str}' format."
+                detail={
+                    "message": f"Paper '{paper_id}' is not available in '{format_str}' format.",
+                    "error": "format_unavailable",
+                    "tar_hint": None,
+                }
             )
         else:
             raise HTTPException(
                 status_code=404,
-                detail=f"Paper with ID '{paper_id}' not found."
+                detail={
+                    "message": f"Paper with ID '{paper_id}' not found.",
+                    "error": "not_found",
+                    "tar_hint": tar_hint,
+                }
             )
 
     # Build metadata headers

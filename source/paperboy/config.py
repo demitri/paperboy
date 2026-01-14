@@ -16,5 +16,17 @@ class Settings(BaseSettings):
     CACHE_DIR_PATH: Optional[str] = None
     CACHE_MAX_SIZE_GB: float = 1.0
 
+    # arXiv direct fallback (last resort when local and upstream both fail)
+    ARXIV_FALLBACK_ENABLED: bool = True
+    ARXIV_TIMEOUT: float = 30.0
+
+    # Typesense search configuration
+    TYPESENSE_HOST: str = "localhost"
+    TYPESENSE_PORT: int = 8108
+    TYPESENSE_PROTOCOL: str = "http"
+    TYPESENSE_API_KEY: Optional[str] = None
+    TYPESENSE_ENABLED: bool = False
+    TYPESENSE_COLLECTION: str = "papers"
+
     class Config:
         env_file = ".env"

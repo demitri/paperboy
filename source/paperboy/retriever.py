@@ -98,6 +98,55 @@ def get_format_from_file_type(file_type: str) -> str:
         return "unknown"
 
 
+def get_expected_tar_pattern(paper_id: str) -> Optional[Dict[str, str]]:
+    """
+    Determine the expected tar file pattern for a paper ID.
+
+    arXiv distributes papers in bulk tar files organized by year/month.
+    This function extracts the pattern so users know which files to download.
+
+    Returns dict with:
+    - year_dir: The year directory (e.g., "2021")
+    - yymm: The year-month code (e.g., "2103")
+    - pdf_pattern: Pattern for PDF tar files (e.g., "arXiv_pdf_2103_*.tar")
+    - src_pattern: Pattern for source tar files (e.g., "arXiv_src_2103_*.tar")
+    - category: Category for old-format papers (e.g., "astro-ph"), None for modern
+
+    Returns None if paper ID format is not recognized.
+    """
+    base_id, _ = parse_paper_id(paper_id)
+
+    # Modern format: YYMM.NNNNN (e.g., 2103.06497)
+    modern_match = re.match(r'^(\d{2})(\d{2})\.(\d+)$', base_id)
+    if modern_match:
+        yy, mm, _ = modern_match.groups()
+        year = 2000 + int(yy) if int(yy) < 90 else 1900 + int(yy)
+        yymm = f"{yy}{mm}"
+        return {
+            "year_dir": str(year),
+            "yymm": yymm,
+            "pdf_pattern": f"arXiv_pdf_{yymm}_*.tar",
+            "src_pattern": f"arXiv_src_{yymm}_*.tar",
+            "category": None,
+        }
+
+    # Old format: categoryYYMMNNN (e.g., astro-ph0412561, hep-lat9107001)
+    old_match = re.match(r'^([a-z-]+)(\d{2})(\d{2})(\d+)$', base_id, re.IGNORECASE)
+    if old_match:
+        category, yy, mm, _ = old_match.groups()
+        year = 2000 + int(yy) if int(yy) < 90 else 1900 + int(yy)
+        yymm = f"{yy}{mm}"
+        return {
+            "year_dir": str(year),
+            "yymm": yymm,
+            "pdf_pattern": f"arXiv_pdf_{category}_{yymm}_*.tar",
+            "src_pattern": f"arXiv_src_{category}_{yymm}_*.tar",
+            "category": category,
+        }
+
+    return None
+
+
 class RetrievalError(Exception):
     """Custom exception for paper retrieval errors"""
     pass
@@ -110,6 +159,10 @@ class PaperRetriever:
         self.upstream_url = settings.UPSTREAM_SERVER_URL
         self.upstream_timeout = settings.UPSTREAM_TIMEOUT
         self.upstream_enabled = settings.UPSTREAM_ENABLED
+
+        # arXiv direct fallback settings
+        self.arxiv_fallback_enabled = settings.ARXIV_FALLBACK_ENABLED
+        self.arxiv_timeout = settings.ARXIV_TIMEOUT
 
         # Initialize cache if configured
         self.cache: Optional[PaperCache] = None
@@ -256,6 +309,118 @@ class PaperRetriever:
             logger.warning(f"Upstream info request error for paper {paper_id}: {e}")
             return None
 
+    def _get_from_arxiv(
+        self,
+        paper_id: str,
+        format: Optional[str] = None
+    ) -> Optional[Tuple[bytes, str]]:
+        """
+        Attempt to retrieve paper directly from arXiv.org.
+
+        Args:
+            paper_id: The paper ID (can include version, e.g., "1501.00963v3")
+            format: Optional format preference ("pdf" or "source")
+
+        Returns:
+            Tuple of (content_bytes, source_type) where source_type is "arxiv_pdf" or "arxiv_source",
+            or None if not available or fallback is disabled.
+        """
+        if not self.arxiv_fallback_enabled:
+            return None
+
+        base_id, version = parse_paper_id(paper_id)
+        arxiv_id = f"{base_id}v{version}" if version else base_id
+
+        # For old-format IDs, need to restore the slash for arXiv URLs
+        # e.g., "astro-ph0412561" -> "astro-ph/0412561"
+        old_format_match = re.match(r'^([a-z-]+)(\d+)$', base_id, re.IGNORECASE)
+        if old_format_match:
+            category, number = old_format_match.groups()
+            arxiv_id = f"{category}/{number}"
+            if version:
+                arxiv_id = f"{arxiv_id}v{version}"
+
+        try:
+            with httpx.Client(timeout=self.arxiv_timeout, follow_redirects=True) as client:
+                # Try PDF first if preferred or no preference
+                if format in (None, "preferred", "pdf"):
+                    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+                    logger.debug(f"Trying arXiv PDF: {pdf_url}")
+                    response = client.get(pdf_url)
+                    if response.status_code == 200 and response.content[:4] == b'%PDF':
+                        logger.info(f"Retrieved {paper_id} from arXiv (PDF)")
+                        return (response.content, "arxiv_pdf")
+
+                # Try source if preferred or PDF failed/not preferred
+                if format in (None, "preferred", "source"):
+                    source_url = f"https://export.arxiv.org/e-print/{arxiv_id}"
+                    logger.debug(f"Trying arXiv source: {source_url}")
+                    response = client.get(source_url)
+                    if response.status_code == 200 and len(response.content) > 0:
+                        logger.info(f"Retrieved {paper_id} from arXiv (source)")
+                        return (response.content, "arxiv_source")
+
+                logger.debug(f"Paper {paper_id} not found on arXiv")
+                return None
+
+        except httpx.TimeoutException:
+            logger.warning(f"arXiv timeout for paper {paper_id}")
+            return None
+        except httpx.RequestError as e:
+            logger.warning(f"arXiv request error for paper {paper_id}: {e}")
+            return None
+
+    def _check_arxiv_availability(self, paper_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Check if a paper is available on arXiv without downloading it.
+        Uses HEAD requests to check availability.
+
+        Returns dict with paper info if available, None otherwise.
+        """
+        if not self.arxiv_fallback_enabled:
+            return None
+
+        base_id, version = parse_paper_id(paper_id)
+        arxiv_id = f"{base_id}v{version}" if version else base_id
+
+        # For old-format IDs, restore the slash
+        old_format_match = re.match(r'^([a-z-]+)(\d+)$', base_id, re.IGNORECASE)
+        if old_format_match:
+            category, number = old_format_match.groups()
+            arxiv_id = f"{category}/{number}"
+            if version:
+                arxiv_id = f"{arxiv_id}v{version}"
+
+        try:
+            with httpx.Client(timeout=self.arxiv_timeout, follow_redirects=True) as client:
+                # Check PDF availability
+                pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+                response = client.head(pdf_url)
+                if response.status_code == 200:
+                    # Extract year from paper ID
+                    year = None
+                    year_match = re.match(r'^(\d{2})\d{2}\.', base_id)
+                    if year_match:
+                        yy = int(year_match.group(1))
+                        year = 2000 + yy if yy < 90 else 1900 + yy
+
+                    return {
+                        "paper_id": base_id,
+                        "requested_version": version,
+                        "file_type": "pdf",
+                        "format": "pdf",
+                        "size_bytes": None,  # HEAD doesn't always return Content-Length
+                        "year": year,
+                        "locally_available": False,
+                        "source": "arxiv",
+                    }
+
+                return None
+
+        except (httpx.TimeoutException, httpx.RequestError) as e:
+            logger.debug(f"arXiv availability check failed for {paper_id}: {e}")
+            return None
+
     def _resolve_paper_id(self, paper_id: str) -> Tuple[str, Optional[int], bool]:
         """
         Resolve the paper ID to lookup in the database.
@@ -329,6 +494,13 @@ class PaperRetriever:
             upstream_info["locally_available"] = False
             return upstream_info
 
+        # Not found in upstream - check arXiv availability
+        arxiv_info = self._check_arxiv_availability(paper_id)
+        if arxiv_info is not None:
+            arxiv_info["upstream_configured"] = bool(self.upstream_url and self.upstream_enabled)
+            arxiv_info["arxiv_fallback_enabled"] = self.arxiv_fallback_enabled
+            return arxiv_info
+
         return None
 
     def get_source_by_id(
@@ -370,11 +542,13 @@ class PaperRetriever:
         # Check format filter against metadata first (if we have local metadata)
         metadata = self._lookup_paper_metadata(lookup_id)
 
-        # If versioned lookup failed and version was required, return error
+        # Track if we need to try arXiv for a specific version
+        try_arxiv_for_version = False
         if metadata is None and version_required:
-            return {"content": None, "content_type": None, "error": "version_not_found"}
+            # Version not in local DB - will try arXiv later
+            try_arxiv_for_version = True
 
-        # If versioned lookup failed, try base ID
+        # If versioned lookup failed, try base ID for local/upstream
         if metadata is None:
             lookup_id = base_id
             metadata = self._lookup_paper_metadata(base_id)
@@ -437,32 +611,235 @@ class PaperRetriever:
             upstream_meta = self._get_info_from_upstream(paper_id)
             return success_response(result, "upstream", upstream_meta)
 
+        # Try arXiv direct fallback as last resort
+        # Use original paper_id to preserve version info
+        arxiv_result = self._get_from_arxiv(paper_id, format)
+        if arxiv_result is not None:
+            content, source_type = arxiv_result
+
+            # Verify format from actual content
+            if format and format != "preferred":
+                content_type = detect_content_type(content)
+                actual_format = "pdf" if content_type == "application/pdf" else "source"
+                if format != actual_format:
+                    return {"content": None, "content_type": None, "error": "format_unavailable"}
+
+            # Cache the result from arXiv
+            cache_key = f"{base_id}v{requested_version}" if requested_version else base_id
+            if self.cache:
+                self.cache.put(cache_key, content)
+
+            return success_response(content, source_type, None)
+
+        # All sources exhausted
+        if try_arxiv_for_version:
+            return {"content": None, "content_type": None, "error": "version_not_found"}
         return {"content": None, "content_type": None, "error": "not_found"}
-    
-    def get_detailed_error(self, paper_id: str) -> Tuple[str, str]:
+
+    def get_random_paper(
+        self,
+        format: Optional[str] = None,
+        category: Optional[str] = None,
+        local_only: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get a random paper from the database.
+
+        Args:
+            format: Optional format filter ("pdf" or "source")
+            category: Optional category filter (e.g., "astro-ph", "hep-lat", "cs.AI")
+                     Searches both paper_id (old-format) and categories column (all papers)
+            local_only: If True, only return papers whose tar files exist locally
+
+        Returns:
+            Dict with paper metadata, or None if no matching papers found.
+        """
+        cursor = self.db_connection.cursor()
+
+        # If local_only, first get list of tar files that exist locally
+        available_archives = None
+        if local_only:
+            available_archives = set()
+            # Walk through tar directory to find available archives
+            for root, dirs, files in os.walk(self.tar_dir_path):
+                for f in files:
+                    if f.endswith('.tar'):
+                        # Get relative path from tar_dir_path
+                        rel_path = os.path.relpath(os.path.join(root, f), self.tar_dir_path)
+                        available_archives.add(rel_path)
+
+            if not available_archives:
+                return None
+
+        # Build the query with optional filters
+        conditions = []
+        params = []
+
+        # Format filter
+        if format == "pdf":
+            conditions.append("file_type = 'pdf'")
+        elif format == "source":
+            conditions.append("file_type IN ('gzip', 'tar')")
+
+        # Category filter - searches both paper_id (old-format) and categories column
+        # Examples: "astro-ph" matches "astro-ph0412561" or categories containing "astro-ph.GA"
+        if category:
+            category_lower = category.lower()
+            # Check if categories column exists
+            if self._has_categories_column():
+                # Match paper_id starting with category (old format) OR categories containing category
+                conditions.append("(paper_id LIKE ? OR categories LIKE ?)")
+                params.append(f"{category_lower}%")
+                params.append(f"%{category_lower}%")
+            else:
+                # Fall back to paper_id only (old format papers)
+                conditions.append("paper_id LIKE ?")
+                params.append(f"{category_lower}%")
+
+        # Filter by available archives if local_only
+        if available_archives:
+            placeholders = ",".join(["?" for _ in available_archives])
+            conditions.append(f"archive_file IN ({placeholders})")
+            params.extend(available_archives)
+
+        # Build WHERE clause
+        where_clause = ""
+        if conditions:
+            where_clause = "WHERE " + " AND ".join(conditions)
+
+        # Get a random paper
+        query = f"""
+            SELECT paper_id, archive_file, offset, size, file_type, year
+            FROM paper_index
+            {where_clause}
+            ORDER BY RANDOM()
+            LIMIT 1
+        """
+
+        cursor.execute(query, params)
+        row = cursor.fetchone()
+
+        if not row:
+            return None
+
+        paper_id, archive_file, offset, size, file_type, year = row
+        tar_file_path = os.path.join(self.tar_dir_path, archive_file)
+
+        return {
+            "paper_id": paper_id,
+            "archive_file": archive_file,
+            "file_type": file_type,
+            "format": get_format_from_file_type(file_type),
+            "size_bytes": size,
+            "year": year,
+            "locally_available": os.path.exists(tar_file_path),
+        }
+
+    def _has_categories_column(self) -> bool:
+        """Check if the categories column exists in paper_index table."""
+        cursor = self.db_connection.cursor()
+        cursor.execute("PRAGMA table_info(paper_index)")
+        columns = [row[1] for row in cursor.fetchall()]
+        return 'categories' in columns
+
+    def get_available_categories(self) -> Dict[str, Any]:
+        """
+        Get list of available categories from the database.
+
+        Returns dict with:
+        - legacy_categories: Categories from old-format paper IDs (e.g., "astro-ph", "hep-lat")
+        - modern_categories: Categories from the categories column (e.g., "astro-ph.GA", "cs.AI")
+        - all_categories: Combined unique list of category prefixes
+        """
+        cursor = self.db_connection.cursor()
+        legacy_categories = set()
+        modern_categories = set()
+
+        # 1. Extract categories from old-format paper IDs
+        cursor.execute("""
+            SELECT DISTINCT paper_id FROM paper_index
+            WHERE paper_id GLOB '[a-z]*'
+            AND paper_id NOT GLOB '[0-9]*'
+        """)
+
+        category_pattern = re.compile(r'^([a-z]+-?[a-z]*)\d', re.IGNORECASE)
+        for row in cursor.fetchall():
+            paper_id = row[0]
+            match = category_pattern.match(paper_id)
+            if match:
+                category = match.group(1).lower()
+                if len(category) >= 2 and not category.isdigit():
+                    legacy_categories.add(category)
+
+        # 2. Extract categories from the categories column (modern format)
+        # Only if the column exists (requires running fetch_categories.py)
+        if self._has_categories_column():
+            cursor.execute("""
+                SELECT DISTINCT categories FROM paper_index
+                WHERE categories IS NOT NULL AND categories != ''
+            """)
+
+            for row in cursor.fetchall():
+                cats = row[0].split()
+                for cat in cats:
+                    modern_categories.add(cat.lower())
+
+        # 3. Build combined list with category prefixes (e.g., "astro-ph" from "astro-ph.GA")
+        all_prefixes = set()
+        for cat in legacy_categories:
+            all_prefixes.add(cat)
+        for cat in modern_categories:
+            # Add both full category and prefix
+            all_prefixes.add(cat)
+            if '.' in cat:
+                prefix = cat.split('.')[0]
+                all_prefixes.add(prefix)
+
+        return {
+            "legacy_categories": sorted(legacy_categories),
+            "modern_categories": sorted(modern_categories),
+            "all_categories": sorted(all_prefixes),
+            "categories_column_exists": self._has_categories_column(),
+        }
+
+    def get_detailed_error(self, paper_id: str) -> Dict[str, Any]:
         """
         Get detailed error information for debugging.
-        Returns (error_type, error_message) tuple.
+
+        Returns dict with:
+        - error_type: str - Type of error (paper_not_found, archive_missing, etc.)
+        - error_message: str - Human-readable error message
+        - tar_hint: Optional[dict] - Expected tar file pattern info (if paper not found)
+        - similar_ids: Optional[list] - Similar paper IDs found in database
         """
         # Normalize the paper ID to match what was searched
+        original_id = paper_id
         paper_id = normalize_paper_id(paper_id)
+
+        # Get tar file hint for this paper ID
+        tar_hint = get_expected_tar_pattern(original_id)
 
         try:
             # Check database connection
             cursor = self.db_connection.cursor()
             cursor.execute("SELECT COUNT(*) FROM paper_index")
             total_papers = cursor.fetchone()[0]
-            
+
             if total_papers == 0:
-                return ("empty_database", "The database contains no papers. Please run the indexing script first.")
-            
+                return {
+                    "error_type": "empty_database",
+                    "error_message": "The database contains no papers. Please run the indexing script first.",
+                    "tar_hint": tar_hint,
+                    "similar_ids": None,
+                }
+
             # Check if paper exists
             cursor.execute(
                 "SELECT archive_file, offset, size FROM paper_index WHERE paper_id = ?",
                 (paper_id,)
             )
             result = cursor.fetchone()
-            
+
             if result is None:
                 # Check for similar paper IDs
                 cursor.execute(
@@ -471,12 +848,18 @@ class PaperRetriever:
                 )
                 similar = cursor.fetchall()
                 similar_ids = [row[0] for row in similar]
-                
+
+                msg = f"Paper ID '{paper_id}' not found in the database."
                 if similar_ids:
-                    return ("paper_not_found", f"Paper ID '{paper_id}' not found. Similar papers: {', '.join(similar_ids[:3])}")
-                else:
-                    return ("paper_not_found", f"Paper ID '{paper_id}' not found in the database.")
-            
+                    msg = f"Paper ID '{paper_id}' not found. Similar papers: {', '.join(similar_ids[:3])}"
+
+                return {
+                    "error_type": "paper_not_found",
+                    "error_message": msg,
+                    "tar_hint": tar_hint,
+                    "similar_ids": similar_ids if similar_ids else None,
+                }
+
             # Paper exists in DB, check file access
             archive_file, offset, size = result
             tar_file_path = os.path.join(self.tar_dir_path, archive_file)
@@ -485,14 +868,40 @@ class PaperRetriever:
                 msg = f"Archive file not found locally: {tar_file_path}"
                 if self.upstream_url and self.upstream_enabled:
                     msg += f" (upstream at {self.upstream_url} was also unavailable or returned not found)"
-                return ("archive_missing", msg)
+                return {
+                    "error_type": "archive_missing",
+                    "error_message": msg,
+                    "tar_hint": None,  # We know exactly which file is needed
+                    "archive_file": archive_file,
+                    "similar_ids": None,
+                }
 
             if not os.access(tar_file_path, os.R_OK):
-                return ("permission_denied", f"Permission denied accessing archive file: {tar_file_path}")
+                return {
+                    "error_type": "permission_denied",
+                    "error_message": f"Permission denied accessing archive file: {tar_file_path}",
+                    "tar_hint": None,
+                    "similar_ids": None,
+                }
 
-            return ("unknown_error", "Unknown error occurred during paper retrieval.")
-            
+            return {
+                "error_type": "unknown_error",
+                "error_message": "Unknown error occurred during paper retrieval.",
+                "tar_hint": None,
+                "similar_ids": None,
+            }
+
         except sqlite3.Error as e:
-            return ("database_error", f"Database error: {e}")
+            return {
+                "error_type": "database_error",
+                "error_message": f"Database error: {e}",
+                "tar_hint": tar_hint,
+                "similar_ids": None,
+            }
         except Exception as e:
-            return ("system_error", f"System error: {e}")
+            return {
+                "error_type": "system_error",
+                "error_message": f"System error: {e}",
+                "tar_hint": tar_hint,
+                "similar_ids": None,
+            }

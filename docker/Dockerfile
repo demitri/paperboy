@@ -1,3 +1,4 @@
+# Build from repo root: docker build -f docker/Dockerfile -t paperboy .
 FROM python:3.9-slim
 
 WORKDIR /app
