@@ -119,20 +119,73 @@ python index/import_kaggle_metadata.py arxiv-metadata-oai-snapshot.json.zip /pat
 
 ## Usage
 
-### Starting the Service
+### Starting the Service (Local Development)
 
 ```bash
-uvicorn source.paperboy.main:app --host 0.0.0.0 --port 8000
+# Set environment variables (or use .env file)
+export LATEXML_BIN=/usr/bin/latexml  # Required for IR generation
+
+uvicorn source.paperboy.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Or with Docker:
+### Docker Deployment (Production)
+
+The Docker image includes LaTeXML and arxiv-src-ir for IR package generation.
+
+**Prerequisites:**
+- Docker and Docker Compose installed
+- `arxiv-src-ir` repository available (for IR generation support)
+
+**Build and deploy:**
+
 ```bash
-docker build -t paperboy .
+cd /path/to/paperboy
+
+# Build and deploy in one command
+./docker/build.sh deploy
+
+# Or build only (without restarting)
+./docker/build.sh
+
+# Then deploy manually
+docker compose -f docker/docker-compose.yml up -d
+```
+
+The build script:
+1. Copies `arxiv-src-ir/python` into the build context
+2. Builds the Docker image with LaTeXML and all dependencies
+3. Cleans up the temporary copy
+4. Optionally restarts the container
+
+**Configure arxiv-src-ir location** (if not at default path):
+```bash
+export ARXIV_SRC_IR_PATH=/path/to/arxiv-src-ir/python
+./docker/build.sh deploy
+```
+
+**Check deployment status:**
+```bash
+# View running container
+docker ps | grep paperboy
+
+# View logs
+docker compose -f docker/docker-compose.yml logs -f
+
+# Health check
+curl http://localhost:8000/health
+
+# Test IR endpoint
+curl "http://localhost:8000/paper/1501.01060/ir" -o test.ir.tar.gz
+tar -tzf test.ir.tar.gz  # Should show: manifest.json, ir/latexml.xml, source/*
+```
+
+**Manual Docker run** (without build script):
+```bash
+docker build -f docker/Dockerfile -t paperboy .
 docker run -p 8000:8000 \
   -v /path/to/arxiv_index.db:/data/arxiv_index.db \
   -v /path/to/tar/files:/data/tar_files \
-  -e INDEX_DB_PATH=/data/arxiv_index.db \
-  -e TAR_DIR_PATH=/data/tar_files \
+  --env-file .env \
   paperboy
 ```
 
@@ -294,6 +347,7 @@ Configuration is managed via environment variables or `.env` file:
 |----------|-------------|----------|---------|
 | `INDEX_DB_PATH` | Path to SQLite index database | Yes | - |
 | `TAR_DIR_PATH` | Path to directory containing tar archives | Yes | - |
+| `LATEXML_BIN` | Path to latexml binary (for IR generation) | For IR | - |
 | `UPSTREAM_SERVER_URL` | URL of upstream Paperboy server | No | None |
 | `UPSTREAM_TIMEOUT` | Upstream request timeout (seconds) | No | 30.0 |
 | `UPSTREAM_ENABLED` | Enable upstream fallback | No | true |
@@ -306,6 +360,41 @@ Configuration is managed via environment variables or `.env` file:
 | `TYPESENSE_PROTOCOL` | http or https | No | http |
 | `TYPESENSE_API_KEY` | Typesense API key | No | None |
 | `TYPESENSE_ENABLED` | Enable Typesense search | No | false |
+
+### IR Package Generation Setup
+
+The `/paper/{paper_id}/ir` endpoint requires LaTeXML and arxiv-src-ir:
+
+1. **Install LaTeXML:**
+   ```bash
+   # Ubuntu/Debian
+   apt-get install latexml
+
+   # macOS
+   brew install latexml
+
+   # Verify installation
+   which latexml
+   latexml --VERSION
+   ```
+
+2. **Set LATEXML_BIN** (required):
+   ```bash
+   # Find the binary
+   which latexml  # e.g., /usr/bin/latexml
+
+   # Add to .env
+   LATEXML_BIN=/usr/bin/latexml
+   ```
+
+3. **Install arxiv-src-ir** (for local development):
+   ```bash
+   pip install -e /path/to/arxiv-src-ir/python
+   ```
+
+   For Docker deployment, the build script handles this automatically.
+
+**Note:** The Docker image includes LaTeXML and arxiv-src-ir pre-installed. `LATEXML_BIN` is set automatically in the container.
 
 ## Supported Paper ID Formats
 
@@ -338,7 +427,8 @@ paperboy/
 │   └── config.py             # Pydantic settings
 ├── docker/                   # Docker configuration
 │   ├── docker-compose.yml    # Docker Compose with Typesense
-│   └── Dockerfile            # Container configuration
+│   ├── Dockerfile            # Container configuration
+│   └── build.sh              # Build and deploy script
 ├── extract_paper.py          # CLI extraction utility
 ├── requirements.txt          # Python dependencies
 └── README.md                 # This file
@@ -534,12 +624,39 @@ uvicorn source.paperboy.main:app --reload --port 8000
 
 ## Deployment Considerations
 
+### Docker Production Deployment
+
+```bash
+# Rebuild and redeploy after code changes
+./docker/build.sh deploy
+
+# View logs
+docker compose -f docker/docker-compose.yml logs -f paperboy
+
+# Restart without rebuilding
+docker compose -f docker/docker-compose.yml restart
+
+# Stop
+docker compose -f docker/docker-compose.yml down
+```
+
+### General Recommendations
+
 - Mount tar archive directory as read-only volume
 - Ensure SQLite database is on fast storage (SSD recommended)
 - Configure cache directory for offline resilience
 - Configure appropriate file handle limits for production
 - Consider using a reverse proxy (nginx) for production deployments
 - Monitor disk I/O for performance optimization
+
+### Redeploying After Code Changes
+
+```bash
+cd /path/to/paperboy
+./docker/build.sh deploy
+```
+
+This rebuilds the image with latest code and restarts the container.
 
 ## External Resources
 
