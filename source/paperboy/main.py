@@ -620,7 +620,7 @@ async def root(request: Request):
 
                 html += `
                     <div class="result-card">
-                        <div class="result-title" onclick="downloadPaper('${{hit.paper_id}}')">${{title}}</div>
+                        <div class="result-title" onclick="window.open('https://arxiv.org/abs/${{hit.paper_id}}', '_blank')">${{title}}</div>
                         <div class="result-meta">
                             <span><strong>${{hit.paper_id}}</strong></span>
                             <span>${{hit.authors ? hit.authors.substring(0, 100) : ''}}</span>
