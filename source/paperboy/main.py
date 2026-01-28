@@ -1372,114 +1372,6 @@ async def get_paper_info(paper_id: str):
     return info
 
 
-@app.get("/paper/{paper_id:path}", tags=["Paper Retrieval"])
-async def get_paper(
-    paper_id: str,
-    format: Optional[PaperFormat] = Query(
-        default=None,
-        description="Filter by format: 'pdf' (PDF only), 'source' (LaTeX source only), 'preferred' (return whatever is available)"
-    )
-):
-    """
-    Retrieve a paper by its arXiv ID. **This is the primary endpoint for AI agents.**
-
-    **Paper ID formats accepted:**
-    - `1501.00963` - Modern arXiv ID (YYMM.NNNNN)
-    - `arXiv:1501.00963v3` - With prefix and version (returns specific version or 404)
-    - `astro-ph/0412561` - Old format with category and slash
-    - `astro-ph0412561` - Old format without slash
-    - `https://arxiv.org/abs/1501.00963` - Full arXiv URL
-
-    **Version handling:**
-    - If you specify a version (e.g., `v2`), that exact version must exist or you get 404
-    - If no version specified, returns the available version
-
-    **Format parameter:**
-    - `format=pdf` - Only return PDF, 404 if not available
-    - `format=source` - Only return source (gzip/tar), 404 if not available
-    - `format=preferred` - Return whatever is available (default)
-
-    **Returns:**
-    - Raw binary content with correct Content-Type header:
-      - `application/pdf` for PDF files
-      - `application/gzip` for gzip-compressed LaTeX source
-      - `application/x-tar` for tar archives
-
-    **Response headers include metadata:**
-    - `X-Paper-ID`: Normalized paper ID
-    - `X-Paper-Format`: Format category (pdf, source, unknown)
-    - `X-Paper-File-Type`: Specific file type (pdf, gzip, tar, unknown)
-    - `X-Paper-Year`: Publication year (if known)
-    - `X-Paper-Version`: Requested version (if specified)
-    - `X-Paper-Source`: Where paper was retrieved from (local, cache, upstream)
-
-    **Errors:**
-    - `404`: Paper not found, version not found, or requested format unavailable
-
-    **Examples:**
-    ```
-    GET /paper/2103.06497
-    GET /paper/2103.06497?format=pdf
-    GET /paper/2103.06497v2
-    GET /paper/astro-ph/0412561?format=source
-    ```
-    """
-    format_str = format.value if format else None
-    result = retriever.get_source_by_id(paper_id, format=format_str)
-
-    if result["content"] is None:
-        error_reason = result["error"]
-        tar_hint = get_expected_tar_pattern(paper_id)
-
-        if error_reason == "version_not_found":
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "message": f"Requested version of paper '{paper_id}' not found.",
-                    "error": "version_not_found",
-                    "tar_hint": tar_hint,
-                }
-            )
-        elif error_reason == "format_unavailable":
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "message": f"Paper '{paper_id}' is not available in '{format_str}' format.",
-                    "error": "format_unavailable",
-                    "tar_hint": None,
-                }
-            )
-        else:
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "message": f"Paper with ID '{paper_id}' not found.",
-                    "error": "not_found",
-                    "tar_hint": tar_hint,
-                }
-            )
-
-    # Build metadata headers
-    headers = {
-        "X-Paper-ID": result.get("paper_id", ""),
-        "X-Paper-Format": result.get("format", "unknown"),
-        "X-Paper-File-Type": result.get("file_type", "unknown"),
-        "X-Paper-Source": result.get("source", "unknown"),
-    }
-
-    # Only add optional headers if values are present
-    if result.get("year"):
-        headers["X-Paper-Year"] = str(result["year"])
-    if result.get("version"):
-        headers["X-Paper-Version"] = str(result["version"])
-
-    return Response(
-        content=result["content"],
-        media_type=result["content_type"],
-        headers=headers
-    )
-
-
 class IRProfile(str, Enum):
     """IR package profile options."""
     text_only = "text-only"
@@ -1586,5 +1478,113 @@ async def get_paper_ir(
     return Response(
         content=ir_bytes,
         media_type="application/gzip",
+        headers=headers
+    )
+
+
+@app.get("/paper/{paper_id:path}", tags=["Paper Retrieval"])
+async def get_paper(
+    paper_id: str,
+    format: Optional[PaperFormat] = Query(
+        default=None,
+        description="Filter by format: 'pdf' (PDF only), 'source' (LaTeX source only), 'preferred' (return whatever is available)"
+    )
+):
+    """
+    Retrieve a paper by its arXiv ID. **This is the primary endpoint for AI agents.**
+
+    **Paper ID formats accepted:**
+    - `1501.00963` - Modern arXiv ID (YYMM.NNNNN)
+    - `arXiv:1501.00963v3` - With prefix and version (returns specific version or 404)
+    - `astro-ph/0412561` - Old format with category and slash
+    - `astro-ph0412561` - Old format without slash
+    - `https://arxiv.org/abs/1501.00963` - Full arXiv URL
+
+    **Version handling:**
+    - If you specify a version (e.g., `v2`), that exact version must exist or you get 404
+    - If no version specified, returns the available version
+
+    **Format parameter:**
+    - `format=pdf` - Only return PDF, 404 if not available
+    - `format=source` - Only return source (gzip/tar), 404 if not available
+    - `format=preferred` - Return whatever is available (default)
+
+    **Returns:**
+    - Raw binary content with correct Content-Type header:
+      - `application/pdf` for PDF files
+      - `application/gzip` for gzip-compressed LaTeX source
+      - `application/x-tar` for tar archives
+
+    **Response headers include metadata:**
+    - `X-Paper-ID`: Normalized paper ID
+    - `X-Paper-Format`: Format category (pdf, source, unknown)
+    - `X-Paper-File-Type`: Specific file type (pdf, gzip, tar, unknown)
+    - `X-Paper-Year`: Publication year (if known)
+    - `X-Paper-Version`: Requested version (if specified)
+    - `X-Paper-Source`: Where paper was retrieved from (local, cache, upstream)
+
+    **Errors:**
+    - `404`: Paper not found, version not found, or requested format unavailable
+
+    **Examples:**
+    ```
+    GET /paper/2103.06497
+    GET /paper/2103.06497?format=pdf
+    GET /paper/2103.06497v2
+    GET /paper/astro-ph/0412561?format=source
+    ```
+    """
+    format_str = format.value if format else None
+    result = retriever.get_source_by_id(paper_id, format=format_str)
+
+    if result["content"] is None:
+        error_reason = result["error"]
+        tar_hint = get_expected_tar_pattern(paper_id)
+
+        if error_reason == "version_not_found":
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "message": f"Requested version of paper '{paper_id}' not found.",
+                    "error": "version_not_found",
+                    "tar_hint": tar_hint,
+                }
+            )
+        elif error_reason == "format_unavailable":
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "message": f"Paper '{paper_id}' is not available in '{format_str}' format.",
+                    "error": "format_unavailable",
+                    "tar_hint": None,
+                }
+            )
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "message": f"Paper with ID '{paper_id}' not found.",
+                    "error": "not_found",
+                    "tar_hint": tar_hint,
+                }
+            )
+
+    # Build metadata headers
+    headers = {
+        "X-Paper-ID": result.get("paper_id", ""),
+        "X-Paper-Format": result.get("format", "unknown"),
+        "X-Paper-File-Type": result.get("file_type", "unknown"),
+        "X-Paper-Source": result.get("source", "unknown"),
+    }
+
+    # Only add optional headers if values are present
+    if result.get("year"):
+        headers["X-Paper-Year"] = str(result["year"])
+    if result.get("version"):
+        headers["X-Paper-Version"] = str(result["version"])
+
+    return Response(
+        content=result["content"],
+        media_type=result["content_type"],
         headers=headers
     )

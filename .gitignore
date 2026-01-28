@@ -3,6 +3,9 @@
 arxiv_index.db
 arXiv_manifest.sqlite3
 
+# Temporary copy of arxiv-src-ir for Docker builds (created by docker/build.sh)
+arxiv-src-ir/
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

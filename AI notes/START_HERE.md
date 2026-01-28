@@ -527,7 +527,7 @@ The `/paper/{paper_id}/ir` endpoint requires additional setup:
    pip install arxiv-src-ir
 
    # Or from source
-   cd ~/Documents/Repositories/GitHub/arxiv-src-ir
+   cd /path/to/arxiv-src-ir/python
    pip install -e .
    ```
 
@@ -543,18 +543,35 @@ The `/paper/{paper_id}/ir` endpoint requires additional setup:
    # See: https://dlmf.nist.gov/LaTeXML/get.html
    ```
 
-3. Verify LaTeXML is working:
+3. **Set the `LATEXML_BIN` environment variable** (required):
    ```bash
-   latexml --VERSION
+   # Find where latexml is installed
+   which latexml
+
+   # Set the environment variable (add to .env file or shell profile)
+   export LATEXML_BIN=/usr/bin/latexml
    ```
 
-4. Test the IR endpoint:
+   Add to your `.env` file:
+   ```env
+   LATEXML_BIN=/usr/bin/latexml
+   ```
+
+4. Verify LaTeXML is working:
+   ```bash
+   $LATEXML_BIN --VERSION
+   ```
+
+5. Test the IR endpoint:
    ```bash
    curl "http://localhost:8000/paper/2103.06497/ir" -o test.ir.tar.gz
-   tar -tzf test.ir.tar.gz  # Should list: manifest.json, output.xml, source/...
+   tar -tzf test.ir.tar.gz  # Should list: manifest.json, ir/latexml.xml, source/...
    ```
 
-**Note:** If `arxiv-src-ir` is not installed, the `/paper/{paper_id}/ir` endpoint will return a 500 error with message "arxiv_src_ir package not installed".
+**Error messages:**
+- If `arxiv-src-ir` is not installed: `"arxiv_src_ir package not installed"`
+- If `LATEXML_BIN` is not set: `"LaTeXML not configured. Set LATEXML_BIN environment variable..."`
+- If paper is PDF-only: `"Paper is not available as LaTeX source. IR packages require source, not PDF."`
 
 ## Key Files to Understand
 
@@ -591,13 +608,63 @@ See [TODO.md](TODO.md) for current tasks, progress, blockers, and open questions
 
 ## Running the Application
 
+### Local Development
+
 ```bash
 # Install dependencies
 pip install -e .
 
+# Set environment variables (or use .env file)
+export LATEXML_BIN=/usr/bin/latexml
+
 # Run the server
 uvicorn source.paperboy.main:app --reload
 ```
+
+### Docker Deployment (Production)
+
+Paperboy runs in Docker in production. The Docker image includes LaTeXML and arxiv-src-ir for IR package generation.
+
+**Prerequisites:**
+- Docker and Docker Compose installed
+- `arxiv-src-ir` repository cloned at `/home/demitri/repositories/arxiv-src-ir`
+  (or set `ARXIV_SRC_IR_PATH` to its location)
+
+**Build and deploy:**
+
+```bash
+cd /home/demitri/repositories/paperboy
+
+# Build and restart in one command
+./docker/build.sh deploy
+
+# Or build only (without restarting)
+./docker/build.sh
+
+# Then deploy manually
+docker compose -f docker/docker-compose.yml up -d
+```
+
+**What the build script does:**
+1. Copies `arxiv-src-ir/python` into the build context (Docker can't follow symlinks)
+2. Builds the Docker image with LaTeXML and arxiv-src-ir installed
+3. Cleans up the temporary copy
+4. Optionally restarts the container (with `deploy` argument)
+
+**Check status:**
+
+```bash
+# View running container
+docker ps | grep paperboy
+
+# View logs
+docker compose -f docker/docker-compose.yml logs -f
+
+# Health check
+curl http://localhost:8000/health
+```
+
+**Environment variables** are loaded from `.env` file. Container-specific paths are overridden in `docker-compose.yml`.
 
 ## Updating the Index with New Tar Files
 

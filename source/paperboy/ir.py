@@ -145,9 +145,9 @@ def generate_ir_package(
         Tuple of (IR package bytes, error message or None)
     """
     try:
-        from arxiv_src_ir import IRBuilder, IRProfile
+        from arxiv_src_ir import IRBuilder, IRProfile, LatexmlNotFoundError
     except ImportError:
-        return None, "arxiv_src_ir package not installed"
+        return None, "arxiv_src_ir package not installed. Install with: pip install arxiv-src-ir"
 
     # Extract LaTeX files
     latex_files, error = extract_latex_from_content(content)
@@ -175,6 +175,10 @@ def generate_ir_package(
             return result.package_bytes, None
         else:
             return None, "IR builder produced no output"
+
+    except LatexmlNotFoundError as e:
+        logger.error(f"LaTeXML not configured: {e}")
+        return None, f"LaTeXML not configured. Set LATEXML_BIN environment variable to the path of the latexml binary."
 
     except Exception as e:
         logger.exception(f"Failed to generate IR package for {paper_id}")
