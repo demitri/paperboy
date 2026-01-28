@@ -169,6 +169,36 @@ GET /paper/{paper_id}/info
 ```
 
 Returns JSON with paper metadata without downloading content:
+
+#### Get IR Package (Intermediate Representation)
+```bash
+GET /paper/{paper_id}/ir                    # Default profile (text-only)
+GET /paper/{paper_id}/ir?profile=text-only  # Text extraction optimized
+GET /paper/{paper_id}/ir?profile=full       # Full LaTeXML output
+```
+
+Returns an IR package containing LaTeXML XML output and source files. IR packages are the canonical format for downstream processing (chunking, indexing, semantic extraction).
+
+**Response:**
+- Success (200): tar.gz archive with `Content-Type: application/gzip`
+- Not Found (404): Paper not found
+- Unprocessable (422): Paper is PDF-only or LaTeXML conversion failed
+
+**IR Package Contents:**
+- `manifest.json` - Package metadata (paper_id, profile, main_tex_file)
+- `output.xml` - LaTeXML XML conversion of the LaTeX source
+- `source/` - Original LaTeX source files
+
+**Requirements:**
+- Paper must have LaTeX source (PDF-only papers return 422)
+- Requires `arxiv-src-ir` package installed
+- LaTeXML must be available on the system
+
+**Example:**
+```bash
+curl "http://localhost:8000/paper/2103.06497/ir" -o paper_ir.tar.gz
+curl "http://localhost:8000/paper/2103.06497/ir?profile=full" -o paper_ir_full.tar.gz
+```
 ```json
 {
   "paper_id": "2103.06497",
@@ -302,6 +332,7 @@ paperboy/
 ├── source/paperboy/          # Main application
 │   ├── main.py               # FastAPI endpoints
 │   ├── retriever.py          # Paper retrieval logic
+│   ├── ir.py                 # IR package generation
 │   ├── search.py             # Typesense search client
 │   ├── cache.py              # LRU disk cache
 │   └── config.py             # Pydantic settings

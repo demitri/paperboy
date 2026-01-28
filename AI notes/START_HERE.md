@@ -59,6 +59,21 @@ GET /search?q=dark+matter+cosmology
 ```
 Returns hits with highlights, faceted filters (category, year, file type), and pagination.
 
+### 7. IR Package Generation
+Get preprocessed papers as IR (Intermediate Representation) packages for downstream processing:
+```bash
+GET /paper/{paper_id}/ir                    # Default profile (text-only)
+GET /paper/{paper_id}/ir?profile=text-only  # Optimized for text extraction
+GET /paper/{paper_id}/ir?profile=full       # Full LaTeXML output
+```
+
+IR packages contain:
+- LaTeXML XML output (structured representation of LaTeX)
+- Original source files
+- Manifest with metadata
+
+**Important:** Only works for papers with LaTeX source. PDF-only papers return 422.
+
 ---
 
 ## Project Structure
@@ -78,6 +93,7 @@ paperboy/
 ├── source/paperboy/        # Main application code
 │   ├── main.py             # FastAPI application (endpoints)
 │   ├── retriever.py        # Paper retrieval logic
+│   ├── ir.py               # IR package generation (LaTeXML)
 │   ├── search.py           # Typesense search client
 │   ├── cache.py            # LRU disk cache for offline access
 │   └── config.py           # Pydantic settings configuration
@@ -144,6 +160,7 @@ cat AI notes/START_HERE.md
 | `/paper/random` | GET | Get a random paper from local archives |
 | `/paper/categories` | GET | List available categories (legacy and modern) |
 | `/search` | GET | Full-text search with filters (requires Typesense) |
+| `/paper/{paper_id}/ir` | GET | **IR endpoint** - Get preprocessed IR package |
 | `/search/stats` | GET | Search index statistics |
 | `/health` | GET | Health check for monitoring |
 | `/debug/config` | GET | Debug configuration and cache stats |
@@ -395,6 +412,79 @@ Returns service health status as JSON.
 
 Returns full configuration details and cache statistics as JSON.
 
+#### GET /paper/{paper_id}/ir
+
+**Generate an IR (Intermediate Representation) package for a paper.**
+
+This endpoint converts LaTeX source to a preprocessed format suitable for downstream processing (chunking, semantic extraction, indexing). The IR package contains LaTeXML XML output plus the original source files.
+
+**Query parameters:**
+- `profile` - IR generation profile:
+  - `text-only` (default) - Optimized for text extraction, smaller output
+  - `full` - Complete LaTeXML output with all structural information
+
+**Response:**
+- Success (200): tar.gz archive containing:
+  - `manifest.json` - Package metadata (paper_id, profile, main_tex_file, created_at)
+  - `output.xml` - LaTeXML XML conversion
+  - `source/` - Original LaTeX source files (.tex, .bbl, .bib, .sty, etc.)
+- Not Found (404): Paper not found in index
+- Unprocessable (422): IR generation failed. Common causes:
+  - Paper is PDF-only (no LaTeX source available)
+  - LaTeXML conversion failed (malformed LaTeX)
+  - No LaTeX files found in source archive
+
+**Response headers:**
+- `Content-Type: application/gzip`
+- `Content-Disposition: attachment; filename="{paper_id}.ir.tar.gz"`
+
+**Error response (422):**
+```json
+{
+  "detail": {
+    "error": "ir_generation_failed",
+    "message": "Content is PDF, not LaTeX source",
+    "paper_id": "2103.06497"
+  }
+}
+```
+
+**Examples:**
+```bash
+# Get IR package with default profile
+curl "http://localhost:8000/paper/2103.06497/ir" -o paper.ir.tar.gz
+
+# Get IR package with full profile
+curl "http://localhost:8000/paper/2103.06497/ir?profile=full" -o paper_full.ir.tar.gz
+
+# Check for errors
+curl -f "http://localhost:8000/paper/2103.06497/ir" -o paper.ir.tar.gz || echo "IR generation failed"
+```
+
+**Dependencies:**
+- `arxiv-src-ir` package must be installed (`pip install arxiv-src-ir` or from source)
+- LaTeXML must be available on the system (see arxiv-src-ir installation docs)
+
+**Performance:**
+- IR generation takes 5-30 seconds depending on paper complexity
+- The endpoint uses a 120-second timeout for LaTeXML processing
+- Consider caching IR packages for frequently accessed papers
+
+**Integration with tesseretica:**
+```python
+from tesseretica.ingestion.retrievers import ARXIVDocumentRetriever
+from tesseretica.documents import ArxivIRDocument
+
+with ARXIVDocumentRetriever() as retriever:
+    ir_doc = retriever.fetchIRDocument("2103.06497", profile="text-only")
+
+    # Access IR package contents
+    print(ir_doc.primary_tex_content)  # Main .tex file
+    print(ir_doc.xml_content)          # LaTeXML XML
+    print(ir_doc.latex_files)          # All source files
+    print(ir_doc.structure_hints)      # Section hierarchy for chunking
+```
+
 ## Configuration
 
 Via `.env` file or environment variables:
@@ -427,11 +517,51 @@ To enable search:
 2. Set `TYPESENSE_ENABLED=true` and `TYPESENSE_API_KEY=your-key`
 3. Sync the database: `python index/sync_typesense.py --db-path $INDEX_DB_PATH --api-key your-key`
 
+**Optional - IR Package Generation:**
+
+The `/paper/{paper_id}/ir` endpoint requires additional setup:
+
+1. Install the `arxiv-src-ir` package:
+   ```bash
+   # From PyPI (when available)
+   pip install arxiv-src-ir
+
+   # Or from source
+   cd ~/Documents/Repositories/GitHub/arxiv-src-ir
+   pip install -e .
+   ```
+
+2. Install LaTeXML on the system:
+   ```bash
+   # macOS (Homebrew)
+   brew install latexml
+
+   # Ubuntu/Debian
+   apt-get install latexml
+
+   # Or from source (for specific version)
+   # See: https://dlmf.nist.gov/LaTeXML/get.html
+   ```
+
+3. Verify LaTeXML is working:
+   ```bash
+   latexml --VERSION
+   ```
+
+4. Test the IR endpoint:
+   ```bash
+   curl "http://localhost:8000/paper/2103.06497/ir" -o test.ir.tar.gz
+   tar -tzf test.ir.tar.gz  # Should list: manifest.json, output.xml, source/...
+   ```
+
+**Note:** If `arxiv-src-ir` is not installed, the `/paper/{paper_id}/ir` endpoint will return a 500 error with message "arxiv_src_ir package not installed".
+
 ## Key Files to Understand
 
 1. **`source/paperboy/retriever.py`** - Core paper retrieval logic with detailed error handling
 2. **`source/paperboy/main.py`** - FastAPI endpoints (see `/docs` for interactive API docs)
-3. **`source/paperboy/search.py`** - Typesense search client with faceting and highlights
+3. **`source/paperboy/ir.py`** - IR package generation (LaTeX extraction, main tex identification, arxiv-src-ir integration)
+4. **`source/paperboy/search.py`** - Typesense search client with faceting and highlights
 4. **`source/paperboy/cache.py`** - LRU disk cache for offline paper access
 5. **`index/index_arxiv_bulk_files.py`** - Index building script
 6. **`index/sync_typesense.py`** - Sync SQLite to Typesense for full-text search

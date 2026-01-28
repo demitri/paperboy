@@ -1478,3 +1478,113 @@ async def get_paper(
         media_type=result["content_type"],
         headers=headers
     )
+
+
+class IRProfile(str, Enum):
+    """IR package profile options."""
+    text_only = "text-only"
+    full = "full"
+
+
+@app.get("/paper/{paper_id:path}/ir", tags=["Paper Retrieval"])
+async def get_paper_ir(
+    paper_id: str,
+    profile: Optional[IRProfile] = Query(
+        default=IRProfile.text_only,
+        description="IR package profile: 'text-only' (default, excludes images) or 'full' (includes all files)"
+    )
+):
+    """
+    Retrieve an IR (Intermediate Representation) package for a paper.
+
+    The IR package is a standardized format containing:
+    - LaTeXML XML output (parsed LaTeX structure)
+    - Source LaTeX files
+    - Manifest with metadata
+
+    This endpoint fetches the paper source and generates an IR package using
+    arxiv-src-ir. The IR package is the canonical format for downstream processing
+    (chunking, embedding, indexing).
+
+    **Paper ID formats accepted:**
+    - Same as `/paper/{paper_id}` endpoint
+
+    **Profile options:**
+    - `text-only` (default): Excludes binary files (images, PDFs) - smaller package
+    - `full`: Includes all source files
+
+    **Returns:**
+    - IR package as `.tar.gz` with Content-Type `application/gzip`
+
+    **Response headers:**
+    - `X-Paper-ID`: Normalized paper ID
+    - `X-IR-Profile`: Package profile (text-only or full)
+
+    **Errors:**
+    - `404`: Paper not found or not available as source
+    - `422`: Cannot generate IR (PDF-only paper or LaTeXML failure)
+
+    **Example:**
+    ```
+    GET /paper/2103.06497/ir
+    GET /paper/2103.06497/ir?profile=full
+    ```
+    """
+    from .ir import generate_ir_package
+
+    # First get the paper source
+    result = retriever.get_source_by_id(paper_id, format="source")
+
+    if result["content"] is None:
+        error_reason = result["error"]
+        tar_hint = get_expected_tar_pattern(paper_id)
+
+        if error_reason == "format_unavailable":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": f"Paper '{paper_id}' is not available as LaTeX source. IR packages require source, not PDF.",
+                    "error": "source_unavailable",
+                }
+            )
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "message": f"Paper with ID '{paper_id}' not found.",
+                    "error": "not_found",
+                    "tar_hint": tar_hint,
+                }
+            )
+
+    # Generate IR package
+    profile_str = profile.value if profile else "text-only"
+    ir_bytes, error = generate_ir_package(
+        paper_id=result.get("paper_id", paper_id),
+        content=result["content"],
+        profile=profile_str,
+    )
+
+    if error:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": f"Failed to generate IR package for '{paper_id}': {error}",
+                "error": "ir_generation_failed",
+            }
+        )
+
+    headers = {
+        "X-Paper-ID": result.get("paper_id", ""),
+        "X-IR-Profile": profile_str,
+        "Content-Disposition": f'attachment; filename="{result.get("paper_id", paper_id)}.ir.tar.gz"',
+    }
+
+    if result.get("year"):
+        headers["X-Paper-Year"] = str(result["year"])
+
+    return Response(
+        content=ir_bytes,
+        media_type="application/gzip",
+        headers=headers
+    )
