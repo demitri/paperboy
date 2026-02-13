@@ -16,9 +16,17 @@ class Settings(BaseSettings):
     CACHE_DIR_PATH: Optional[str] = None
     CACHE_MAX_SIZE_GB: float = 1.0
 
+    # IR cache configuration
+    IR_CACHE_DIR_PATH: Optional[str] = None
+    IR_CACHE_MAX_SIZE_GB: float = 5.0
+
     # arXiv direct fallback (last resort when local and upstream both fail)
     ARXIV_FALLBACK_ENABLED: bool = True
     ARXIV_TIMEOUT: float = 30.0
+
+    # USPTO patent configuration (optional — enables /patent/ endpoints)
+    PATENT_INDEX_DB_PATH: Optional[str] = None
+    PATENT_BULK_DIR_PATH: Optional[str] = None
 
     # Typesense search configuration
     TYPESENSE_HOST: str = "localhost"

@@ -6,6 +6,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from .config import Settings
+from .ir_cache import IRCache
+from .patent_retriever import PatentRetriever, normalize_patent_id
 from .retriever import PaperRetriever, RetrievalError, get_expected_tar_pattern
 from .search import SearchClient
 
@@ -30,6 +32,20 @@ except Exception as e:
     startup_error = f"Configuration error: {e}"
     retriever = None
     search_client = None
+
+# Initialize IR cache if configured
+ir_cache: Optional[IRCache] = None
+if settings.IR_CACHE_DIR_PATH:
+    ir_cache = IRCache(settings.IR_CACHE_DIR_PATH, settings.IR_CACHE_MAX_SIZE_GB)
+
+# Initialize patent retriever if configured (requires both DB path and bulk dir)
+patent_retriever: Optional[PatentRetriever] = None
+if settings.PATENT_INDEX_DB_PATH and settings.PATENT_BULK_DIR_PATH:
+    try:
+        patent_retriever = PatentRetriever(settings)
+    except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"Patent retriever not available: {e}")
 
 app = FastAPI(
     title="Paperboy",
@@ -1040,6 +1056,7 @@ async def health():
     - `upstream_configured`: Whether an upstream fallback server is configured
     - `upstream_enabled`: Whether upstream fallback is enabled
     - `cache_configured`: Whether paper caching is enabled
+    - `ir_cache_configured`: Whether IR package caching is enabled
     - `arxiv_fallback_enabled`: Whether direct arXiv.org fallback is enabled
     - `search_available`: Whether Typesense search is available
     """
@@ -1050,8 +1067,10 @@ async def health():
         "upstream_configured": bool(settings.UPSTREAM_SERVER_URL),
         "upstream_enabled": settings.UPSTREAM_ENABLED,
         "cache_configured": bool(settings.CACHE_DIR_PATH),
+        "ir_cache_configured": bool(settings.IR_CACHE_DIR_PATH),
         "arxiv_fallback_enabled": settings.ARXIV_FALLBACK_ENABLED,
         "search_available": search_client.is_available if search_client else False,
+        "patent_configured": patent_retriever is not None,
     }
 
 
@@ -1064,6 +1083,7 @@ async def debug_config():
     - All configuration paths and settings
     - Whether required files/directories exist
     - Cache statistics (if caching enabled): size, utilization, paper count
+    - IR cache statistics (if IR caching enabled): size, utilization, package count
     - Search statistics (if Typesense enabled): document count
     """
     import os
@@ -1075,19 +1095,29 @@ async def debug_config():
         "UPSTREAM_ENABLED": settings.UPSTREAM_ENABLED,
         "CACHE_DIR_PATH": settings.CACHE_DIR_PATH,
         "CACHE_MAX_SIZE_GB": settings.CACHE_MAX_SIZE_GB,
+        "IR_CACHE_DIR_PATH": settings.IR_CACHE_DIR_PATH,
+        "IR_CACHE_MAX_SIZE_GB": settings.IR_CACHE_MAX_SIZE_GB,
         "ARXIV_FALLBACK_ENABLED": settings.ARXIV_FALLBACK_ENABLED,
         "ARXIV_TIMEOUT": settings.ARXIV_TIMEOUT,
         "TYPESENSE_HOST": settings.TYPESENSE_HOST,
         "TYPESENSE_PORT": settings.TYPESENSE_PORT,
         "TYPESENSE_ENABLED": settings.TYPESENSE_ENABLED,
+        "PATENT_INDEX_DB_PATH": settings.PATENT_INDEX_DB_PATH,
+        "PATENT_BULK_DIR_PATH": settings.PATENT_BULK_DIR_PATH,
         "db_exists": os.path.exists(settings.INDEX_DB_PATH),
         "tar_dir_exists": os.path.exists(settings.TAR_DIR_PATH),
+        "patent_index_db_exists": os.path.exists(settings.PATENT_INDEX_DB_PATH) if settings.PATENT_INDEX_DB_PATH else False,
+        "patent_bulk_dir_exists": os.path.exists(settings.PATENT_BULK_DIR_PATH) if settings.PATENT_BULK_DIR_PATH else False,
         "working_directory": os.getcwd()
     }
 
     # Add cache stats if cache is configured
     if retriever and retriever.cache:
         config["cache_stats"] = retriever.cache.get_stats()
+
+    # Add IR cache stats if IR cache is configured
+    if ir_cache:
+        config["ir_cache_stats"] = ir_cache.get_stats()
 
     # Add search stats if search is configured
     if search_client:
@@ -1411,6 +1441,7 @@ async def get_paper_ir(
     **Response headers:**
     - `X-Paper-ID`: Normalized paper ID
     - `X-IR-Profile`: Package profile (text-only or full)
+    - `X-Cache-Status`: 'hit' if served from cache, 'miss' if freshly generated
 
     **Errors:**
     - `404`: Paper not found or not available as source
@@ -1424,7 +1455,33 @@ async def get_paper_ir(
     """
     from .ir import generate_ir_package
 
-    # First get the paper source
+    profile_str = profile.value if profile else "text-only"
+
+    # Check cache first (before fetching source)
+    if ir_cache:
+        cached_ir = ir_cache.get(paper_id, profile_str)
+        if cached_ir is not None:
+            # Get paper info for metadata headers (lightweight lookup)
+            paper_info = retriever.get_paper_info(paper_id)
+            normalized_id = paper_info.get("paper_id", paper_id) if paper_info else paper_id
+
+            headers = {
+                "X-Paper-ID": normalized_id,
+                "X-IR-Profile": profile_str,
+                "X-Cache-Status": "hit",
+                "Content-Disposition": f'attachment; filename="{normalized_id}.ir.tar.gz"',
+            }
+
+            if paper_info and paper_info.get("year"):
+                headers["X-Paper-Year"] = str(paper_info["year"])
+
+            return Response(
+                content=cached_ir,
+                media_type="application/gzip",
+                headers=headers
+            )
+
+    # Cache miss - fetch the paper source
     result = retriever.get_source_by_id(paper_id, format="source")
 
     if result["content"] is None:
@@ -1450,7 +1507,6 @@ async def get_paper_ir(
             )
 
     # Generate IR package
-    profile_str = profile.value if profile else "text-only"
     ir_bytes, error = generate_ir_package(
         paper_id=result.get("paper_id", paper_id),
         content=result["content"],
@@ -1458,6 +1514,7 @@ async def get_paper_ir(
     )
 
     if error:
+        # Don't cache failed generations
         raise HTTPException(
             status_code=422,
             detail={
@@ -1466,9 +1523,14 @@ async def get_paper_ir(
             }
         )
 
+    # Cache the successful result
+    if ir_cache:
+        ir_cache.put(paper_id, profile_str, ir_bytes)
+
     headers = {
         "X-Paper-ID": result.get("paper_id", ""),
         "X-IR-Profile": profile_str,
+        "X-Cache-Status": "miss",
         "Content-Disposition": f'attachment; filename="{result.get("paper_id", paper_id)}.ir.tar.gz"',
     }
 
@@ -1479,6 +1541,154 @@ async def get_paper_ir(
         content=ir_bytes,
         media_type="application/gzip",
         headers=headers
+    )
+
+
+@app.post("/ir/cache/clear", tags=["Status"])
+async def clear_ir_cache():
+    """
+    Clear the IR package cache.
+
+    Use this endpoint after updating arxiv-src-ir to regenerate packages with the new version.
+
+    **Returns:**
+    - `cleared`: Number of cached packages removed
+    - `cache_configured`: Whether IR caching is enabled
+
+    **Note:** This operation cannot be undone. Cached packages will be regenerated
+    on subsequent requests.
+    """
+    if not ir_cache:
+        return {
+            "cache_configured": False,
+            "cleared": 0,
+            "message": "IR cache is not configured"
+        }
+
+    count = ir_cache.clear()
+    return {
+        "cache_configured": True,
+        "cleared": count,
+        "message": f"Cleared {count} IR packages from cache"
+    }
+
+
+# ---------------------------------------------------------------------------
+# USPTO Patent Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/patent/{patent_id:path}/info", tags=["Patent Retrieval"])
+async def get_patent_info(patent_id: str):
+    """
+    Get metadata about a patent without downloading its content.
+
+    **Response fields:**
+    - `patent_id`: Bare patent document number
+    - `kind_code`: Kind code (B1, B2, A1, etc.)
+    - `doc_type`: "grant" or "application"
+    - `size_bytes`: XML size in bytes
+    - `year`: Publication year
+    - `locally_available`: Whether the patent ZIP is stored locally
+    - `source`: Where metadata came from ("local" or "upstream")
+
+    **Patent ID formats accepted:**
+    - `US11123456B2` - With US prefix and kind code
+    - `US11123456` - With US prefix only
+    - `11123456` - Bare document number
+    - `US20200123456A1` - Application publication number
+
+    **Example:**
+    ```
+    GET /patent/US11123456B2/info
+    ```
+    """
+    if not patent_retriever:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "USPTO patent retrieval is not configured. Set PATENT_BULK_DIR_PATH.",
+                "error": "not_configured",
+            }
+        )
+
+    info = patent_retriever.get_patent_info(patent_id)
+
+    if info is None:
+        bare_id = normalize_patent_id(patent_id)
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Patent '{bare_id}' not found.",
+                "error": "not_found",
+            }
+        )
+
+    return info
+
+
+@app.get("/patent/{patent_id:path}", tags=["Patent Retrieval"])
+async def get_patent(patent_id: str):
+    """
+    Retrieve a patent by its document number. Returns raw XML.
+
+    **This is the primary endpoint for patent retrieval.**
+
+    **Patent ID formats accepted:**
+    - `US11123456B2` - With US prefix and kind code
+    - `US11123456` - With US prefix only
+    - `11123456` - Bare document number
+    - `US20200123456A1` - Application publication number
+
+    **Returns:**
+    - Raw XML content with `Content-Type: application/xml`
+
+    **Response headers:**
+    - `X-Patent-ID`: Bare patent document number
+    - `X-Patent-Kind-Code`: Kind code (B2, A1, etc.) if known
+    - `X-Patent-Doc-Type`: "grant" or "application"
+    - `X-Patent-Source`: Where patent was retrieved from (local, upstream)
+
+    **Examples:**
+    ```
+    GET /patent/11123456
+    GET /patent/US11123456B2
+    GET /patent/US20200123456A1
+    ```
+    """
+    if not patent_retriever:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "USPTO patent retrieval is not configured. Set PATENT_BULK_DIR_PATH.",
+                "error": "not_configured",
+            }
+        )
+
+    result = patent_retriever.get_patent_by_id(patent_id)
+
+    if result["content"] is None:
+        bare_id = normalize_patent_id(patent_id)
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Patent '{bare_id}' not found.",
+                "error": "not_found",
+            }
+        )
+
+    headers = {
+        "X-Patent-ID": result.get("patent_id", ""),
+        "X-Patent-Source": result.get("source", "unknown"),
+    }
+    if result.get("kind_code"):
+        headers["X-Patent-Kind-Code"] = result["kind_code"]
+    if result.get("doc_type"):
+        headers["X-Patent-Doc-Type"] = result["doc_type"]
+
+    return Response(
+        content=result["content"],
+        media_type="application/xml",
+        headers=headers,
     )
 
 

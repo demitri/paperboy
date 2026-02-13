@@ -16,11 +16,18 @@ services:
       # These override .env values for container-specific paths
       - INDEX_DB_PATH=/data/arxiv_index.db
       - TAR_DIR_PATH=/data/tar_files
+      - IR_CACHE_DIR_PATH=/data/ir_cache
+      # USPTO patent configuration
+      - PATENT_INDEX_DB_PATH=/data/uspto_index.db
+      - PATENT_BULK_DIR_PATH=/data/uspto
       # Typesense: use host's service via host.docker.internal
       - TYPESENSE_HOST=host.docker.internal
     volumes:
       - /data/paperboy_data/arXiv_manifest.sqlite3:/data/arxiv_index.db:ro
       - /data/paperboy_data/arXiv:/data/tar_files:ro
+      - /data/paperboy_data/ir_cache:/data/ir_cache
+      - /data/paperboy_data/uspto_manifest.sqlite3:/data/uspto_index.db:ro
+      - /data/uspto:/data/uspto:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
