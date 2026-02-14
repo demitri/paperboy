@@ -1,16 +1,17 @@
 # Paperboy
 
-A Python microservice for efficiently delivering individual academic papers from arXiv's bulk tar archives using indexed database lookups.
+A Python microservice for efficiently delivering individual academic papers (arXiv) and patents (USPTO) from bulk archives using indexed database lookups.
 
 ## Overview
 
-arXiv distributes papers in massive bulk tar archive files (multiple GB each). This service solves the problem of accessing individual papers without extracting entire archives by using SQLite indexing to enable instant retrieval through direct byte-level reads.
+arXiv distributes papers in massive bulk tar archive files, and USPTO distributes patents in bulk ZIP files containing concatenated XML. This service solves the problem of accessing individual documents without extracting entire archives by using SQLite indexing to enable instant retrieval through direct byte-level reads.
 
 ## Features
 
 - **Fast Individual Paper Retrieval** - Extract papers in milliseconds without decompressing full archives
+- **USPTO Patent Retrieval** - Serve individual patents from bulk ZIP archives as raw XML
 - **Full-Text Search** - Search by title, authors, abstract via Typesense
-- **SQLite-Based Indexing** - O(1) lookup performance for paper locations
+- **SQLite-Based Indexing** - O(1) lookup performance for document locations
 - **Multiple Format Support** - Retrieve PDFs or gzipped LaTeX source files
 - **Web Interface** - Search interface with faceted filtering and instant results
 - **REST API** - Programmatic access via clean API endpoints
@@ -26,23 +27,28 @@ arXiv distributes papers in massive bulk tar archive files (multiple GB each). T
 ### Data Flow
 
 1. **Indexing Phase** (one-time setup):
-   - Scan tar files organized by year (1991-present)
-   - Record each paper's byte offset and size
-   - Build SQLite index with hash-based deduplication
+   - **arXiv**: Scan tar files organized by year (1991-present), record byte offset/size per paper
+   - **USPTO**: Scan ZIP files in PTGRXML/APPXML directories, split concatenated XML, record byte offset/size per patent
+   - Build SQLite indexes (one per document type) with hash-based deduplication
 
 2. **Retrieval Phase** (runtime):
-   - User requests paper via web UI or API
-   - FastAPI queries SQLite database for paper location
-   - Service reads specific byte range directly from tar file
-   - Returns paper to user with metadata headers
+   - User requests document via web UI or API
+   - FastAPI queries SQLite database for document location
+   - **arXiv**: Direct byte-range read from tar file
+   - **USPTO**: Open ZIP, decompress inner XML, seek to offset, read patent block
+   - Returns document to user with metadata headers
 
 ### Retrieval Order
 
-When a paper is requested, sources are tried in this order:
+When an arXiv paper is requested, sources are tried in this order:
 1. **Cache** - Local disk cache (if configured)
 2. **Local tar files** - Direct read from indexed archives
 3. **Upstream server** - Another Paperboy instance (if configured)
 4. **arXiv.org** - Direct fetch from arxiv.org (if enabled)
+
+When a USPTO patent is requested:
+1. **Local ZIP files** - Direct read from indexed archives
+2. **Upstream server** - Another Paperboy instance (if configured)
 
 ### Technology Stack
 
@@ -98,6 +104,10 @@ ARXIV_TIMEOUT=30.0
 CACHE_DIR_PATH="/path/to/cache"
 CACHE_MAX_SIZE_GB=1.0
 
+# Optional: USPTO patent retrieval
+PATENT_INDEX_DB_PATH="/path/to/uspto_manifest.sqlite3"
+PATENT_BULK_DIR_PATH="/path/to/uspto"
+
 # Optional: Typesense search (requires running Typesense server)
 TYPESENSE_HOST=localhost
 TYPESENSE_PORT=8108
@@ -111,7 +121,12 @@ TYPESENSE_ENABLED=true
 python index/index_arxiv_bulk_files.py /path/to/tar/files --db-path /path/to/arxiv_index.db
 ```
 
-6. (Optional) Import metadata from Kaggle dataset:
+6. (Optional) Build the USPTO patent index:
+```bash
+python index/index_uspto_bulk_files.py /path/to/uspto --db-path /path/to/uspto_manifest.sqlite3
+```
+
+7. (Optional) Import metadata from Kaggle dataset:
 ```bash
 # Download arxiv-metadata-oai-snapshot.json.zip from Kaggle first
 python index/import_kaggle_metadata.py arxiv-metadata-oai-snapshot.json.zip /path/to/arxiv_index.db
@@ -221,7 +236,39 @@ curl "http://localhost:8000/paper/2103.06497?format=source" -o paper.gz
 GET /paper/{paper_id}/info
 ```
 
-Returns JSON with paper metadata without downloading content:
+Returns JSON with paper metadata without downloading content.
+
+#### Get Patent by ID (USPTO)
+```bash
+GET /patent/{patent_id}
+```
+
+Retrieves raw USPTO patent XML. Accepts bare numbers (`11123456`), with US prefix (`US11123456B2`), design patents (`D0987654S`), etc.
+
+**Response Headers:** `X-Patent-ID`, `X-Patent-Kind-Code`, `X-Patent-Doc-Type`, `X-Patent-Source`
+
+Example:
+```bash
+curl http://localhost:8000/patent/US11123456B2 -o patent.xml
+```
+
+#### Get Patent Metadata (USPTO)
+```bash
+GET /patent/{patent_id}/info
+```
+
+Returns JSON:
+```json
+{
+  "patent_id": "11123456",
+  "kind_code": "B2",
+  "doc_type": "grant",
+  "size_bytes": 111466,
+  "year": 2021,
+  "locally_available": true,
+  "source": "local"
+}
+```
 
 #### Get IR Package (Intermediate Representation)
 ```bash
@@ -355,6 +402,8 @@ Configuration is managed via environment variables or `.env` file:
 | `ARXIV_TIMEOUT` | arXiv request timeout (seconds) | No | 30.0 |
 | `CACHE_DIR_PATH` | Directory for paper cache | No | None |
 | `CACHE_MAX_SIZE_GB` | Maximum cache size in GB | No | 1.0 |
+| `PATENT_INDEX_DB_PATH` | Path to USPTO SQLite index | No | None |
+| `PATENT_BULK_DIR_PATH` | Path to USPTO bulk ZIP files | No | None |
 | `TYPESENSE_HOST` | Typesense server host | No | localhost |
 | `TYPESENSE_PORT` | Typesense server port | No | 8108 |
 | `TYPESENSE_PROTOCOL` | http or https | No | http |
@@ -412,15 +461,19 @@ The `/paper/{paper_id}/ir` endpoint requires LaTeXML and arxiv-src-ir:
 paperboy/
 ├── AI notes/                 # AI agent documentation
 │   ├── START_HERE.md         # Quick start for AI agents
-│   └── TODO.md               # Task tracking
+│   ├── TODO.md               # Task tracking
+│   └── USPTO_PLAN.md         # USPTO implementation plan (completed)
 ├── index/                    # Indexing components
-│   ├── arXiv_manifest.sqlite3    # SQLite index (not committed)
-│   ├── index_arxiv_bulk_files.py # Index builder script
-│   ├── import_kaggle_metadata.py # Kaggle metadata importer
+│   ├── arXiv_manifest.sqlite3     # arXiv SQLite index (not committed)
+│   ├── uspto_manifest.sqlite3     # USPTO SQLite index (not committed)
+│   ├── index_arxiv_bulk_files.py  # arXiv index builder script
+│   ├── index_uspto_bulk_files.py  # USPTO patent index builder script
+│   ├── import_kaggle_metadata.py  # Kaggle metadata importer
 │   └── sync_typesense.py     # Typesense search indexer
 ├── source/paperboy/          # Main application
 │   ├── main.py               # FastAPI endpoints
-│   ├── retriever.py          # Paper retrieval logic
+│   ├── retriever.py          # arXiv paper retrieval logic
+│   ├── patent_retriever.py   # USPTO patent retrieval logic
 │   ├── ir.py                 # IR package generation
 │   ├── search.py             # Typesense search client
 │   ├── cache.py              # LRU disk cache
@@ -436,7 +489,9 @@ paperboy/
 
 ## Database Schema
 
-### `paper_index` Table
+Each document type uses a separate SQLite database file.
+
+### `paper_index` Table (arXiv — in `arXiv_manifest.sqlite3`)
 
 **Core fields (from indexing):**
 - `paper_id` - arXiv paper identifier (PRIMARY KEY)
@@ -458,7 +513,17 @@ paperboy/
 - `report_no` - Report number
 - `versions` - Available versions
 
-### `bulk_files` Table
+### `patent_index` Table (USPTO — in `uspto_manifest.sqlite3`)
+
+- `patent_id` - Bare document number (PRIMARY KEY), e.g., "11123456"
+- `archive_file` - ZIP filename, e.g., "PTGRXML/ipg210921.zip"
+- `offset` - Byte offset within decompressed XML inside the ZIP
+- `size` - Size of patent XML block in bytes
+- `doc_type` - "grant" or "application"
+- `kind_code` - Patent kind code (B2, A1, S, etc.)
+- `year` - Publication year
+
+### `bulk_files` Table (in both databases)
 - `file_path` - Archive file path
 - `file_hash` - MD5 hash for deduplication
 - `indexed_at` - Indexing timestamp

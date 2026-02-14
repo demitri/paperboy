@@ -1,5 +1,7 @@
 # Plan: Add USPTO Patent Retrieval to Paperboy
 
+> **Status: COMPLETED** (2026-02-13) — All items implemented and deployed. 14M+ patents indexed.
+
 ## Overview
 
 Add a parallel retrieval path for USPTO patent documents alongside existing arXiv paper support. Patents are served as raw XML from bulk ZIP archives containing concatenated XML documents. The architecture keeps arXiv and USPTO code separate — no shared base classes or over-abstraction — just a new retriever, new endpoints, and a new indexer.
@@ -14,7 +16,7 @@ New USPTO path:
   /patent/{patent_id}  →  PatentRetriever  →  patent_index table  →  .zip files
 ```
 
-Both share the same SQLite database file, same upstream fallback pattern, and same config object.
+Each uses a **separate SQLite database file** (arXiv: `arXiv_manifest.sqlite3`, USPTO: `uspto_manifest.sqlite3`). Both share the same upstream fallback pattern and same config object.
 
 ---
 

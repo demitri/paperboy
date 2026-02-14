@@ -9,6 +9,7 @@ This document tracks todo items, progress, blockers, and open questions.
 | Status | Task | Priority | Notes |
 |--------|------|----------|-------|
 | [x] | Typesense search integration | High | Full-text search for papers |
+| [x] | USPTO patent retrieval | High | 14M+ patents indexed & deployed |
 
 **Status legend**: `[ ]` pending, `[~]` in progress, `[x]` completed, `[!]` blocked
 
@@ -165,6 +166,26 @@ TYPESENSE_ENABLED=true
 
 ## Progress History
 
+### 2026-02-13
+
+**USPTO patent retrieval — fully implemented and deployed**
+- Created `source/paperboy/patent_retriever.py` — PatentRetriever class with ID parsing/normalization
+  - `parse_patent_id()` strips US prefix, extracts kind code (B2, A1, S, etc.)
+  - Handles design (D*), reissue (RE*), and plant (PP*) patent prefixes
+  - Retrieval chain: local ZIP → upstream server
+- Created `index/index_uspto_bulk_files.py` — parallel indexer using ProcessPoolExecutor
+  - Processes ZIP files containing concatenated XML patent documents
+  - Splits on `<?xml` boundaries, extracts patent IDs via regex (no lxml)
+  - Progress bar in default mode; per-file logging behind `--verbose` flag
+  - Idempotent: tracks MD5 hashes, safe to stop and restart
+- Added `PATENT_INDEX_DB_PATH` and `PATENT_BULK_DIR_PATH` to config.py
+- Added endpoints: `GET /patent/{patent_id:path}` (XML) and `GET /patent/{patent_id:path}/info` (JSON)
+- Updated `/health` with `patent_configured` field, `/debug/config` with patent settings
+- Separate SQLite database per document type (arXiv uses arXiv_manifest.sqlite3, USPTO uses uspto_manifest.sqlite3)
+- Updated `docker/docker-compose.yml` with USPTO volume mounts and environment variables
+- **Indexing results**: 14,011,347 patents (6.2M grants, 7.4M applications, 379K unknown doc_type), years 2005–2026, 2,616 ZIP files
+- Deployed via `./docker/build.sh deploy` — container running and healthy
+
 ### 2026-01-14
 
 **Typesense search integration**
@@ -238,6 +259,7 @@ TYPESENSE_ENABLED=true
 
 | Date | Task | Notes |
 |------|------|-------|
+| 2026-02-13 | USPTO patent retrieval | 14M+ patents, separate DB, parallel indexer, deployed |
 | 2026-01-14 | Import Kaggle metadata | 1.1M papers with full metadata |
 | 2026-01-14 | Add local_only to random | Select from entire DB or local only |
 | 2026-01-10 | Add metadata response headers | X-Paper-ID/Format/File-Type/Year/Version/Source headers |
@@ -266,7 +288,9 @@ TYPESENSE_ENABLED=true
 
 ## Notes
 
-- The database now has 1.27M+ papers indexed
-- 1.1M papers have full metadata (title, authors, abstract, categories)
-- Database is git-ignored; must be recreated or copied when setting up
-- Index script uses MD5 hashing for deduplication
+- **arXiv**: 1.27M+ papers indexed in `arXiv_manifest.sqlite3`, 1.1M with full metadata
+- **USPTO**: 14M+ patents indexed in `uspto_manifest.sqlite3` (6.2M grants, 7.4M applications)
+- Each document type uses a separate SQLite database file
+- Databases are git-ignored; must be recreated or copied when setting up
+- Both indexers use MD5 hashing for idempotent re-indexing
+- USPTO bulk data update command: `./uspto/uspto_downloader.py --out /data/uspto --products PTGRXML APPXML` (in corpus_downloads repo)

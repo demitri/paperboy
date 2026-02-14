@@ -2,9 +2,9 @@
 
 ## What is Paperboy?
 
-Paperboy is a Python microservice that delivers individual academic papers from arXiv's bulk tar archives using SQLite indexing. The key innovation is **instant retrieval** of papers without decompressing entire multi-gigabyte archive files.
+Paperboy is a Python microservice that delivers individual academic papers (arXiv) and patents (USPTO) from bulk archives using SQLite indexing. The key innovation is **instant retrieval** of documents without decompressing entire multi-gigabyte archive files.
 
-**Core problem solved**: arXiv distributes papers in massive bulk tar files (multiple GB each). Paperboy uses byte-level direct reads from tar files, enabled by a pre-built SQLite index.
+**Core problem solved**: arXiv distributes papers in massive bulk tar files, and USPTO distributes patents in bulk ZIP files containing concatenated XML. Paperboy uses byte-level direct reads from these archives, enabled by pre-built SQLite indexes.
 
 ## Key Features for AI Agents
 
@@ -74,6 +74,22 @@ IR packages contain:
 
 **Important:** Only works for papers with LaTeX source. PDF-only papers return 422.
 
+### 8. USPTO Patent Retrieval
+Retrieve USPTO patents as raw XML from bulk archives:
+```bash
+GET /patent/{patent_id}         # Raw XML content
+GET /patent/{patent_id}/info    # JSON metadata
+```
+
+Patent ID formats accepted:
+- `11123456` — bare document number
+- `US11123456B2` — with US prefix and kind code
+- `US20200123456A1` — application number
+- `D0987654S` — design patent
+- `RE12345E` — reissue patent
+
+Response headers: `X-Patent-ID`, `X-Patent-Kind-Code`, `X-Patent-Doc-Type`, `X-Patent-Source`
+
 ---
 
 ## Project Structure
@@ -82,17 +98,21 @@ IR packages contain:
 paperboy/
 ├── AI notes/               # AI agent documentation (you are here)
 │   ├── START_HERE.md       # This file
-│   └── TODO.md             # Task tracking, progress, blockers
+│   ├── TODO.md             # Task tracking, progress, blockers
+│   └── USPTO_PLAN.md       # USPTO implementation plan (completed)
 │
 ├── index/                  # Indexing components
-│   ├── arXiv_manifest.sqlite3    # SQLite index database (1.27M+ papers, not committed)
-│   ├── index_arxiv_bulk_files.py  # Script to build/update the index
-│   ├── import_kaggle_metadata.py # Import metadata from Kaggle dataset
-│   └── sync_typesense.py         # Sync SQLite to Typesense search engine
+│   ├── arXiv_manifest.sqlite3     # arXiv SQLite index (1.27M+ papers, not committed)
+│   ├── uspto_manifest.sqlite3     # USPTO SQLite index (14M+ patents, not committed)
+│   ├── index_arxiv_bulk_files.py  # Script to build/update arXiv index
+│   ├── index_uspto_bulk_files.py  # Script to build/update USPTO patent index
+│   ├── import_kaggle_metadata.py  # Import metadata from Kaggle dataset
+│   └── sync_typesense.py          # Sync SQLite to Typesense search engine
 │
 ├── source/paperboy/        # Main application code
 │   ├── main.py             # FastAPI application (endpoints)
-│   ├── retriever.py        # Paper retrieval logic
+│   ├── retriever.py        # arXiv paper retrieval logic
+│   ├── patent_retriever.py # USPTO patent retrieval logic
 │   ├── ir.py               # IR package generation (LaTeXML)
 │   ├── search.py           # Typesense search client
 │   ├── cache.py            # LRU disk cache for offline access
@@ -121,46 +141,53 @@ cat AI notes/START_HERE.md
 
 ### Two-Phase Architecture
 
-1. **Indexing Phase** (one-time setup via `index/index_arxiv_bulk_files.py`):
-   - Scans tar archives and reads table of contents (no extraction)
-   - Records byte offset and size of each paper in SQLite
-   - Uses MD5 hashing for deduplication
+1. **Indexing Phase** (one-time setup):
+   - **arXiv** (`index/index_arxiv_bulk_files.py`): Scans tar archives, records byte offset/size per paper
+   - **USPTO** (`index/index_uspto_bulk_files.py`): Scans ZIP files, splits concatenated XML on `<?xml` boundaries, records byte offset/size per patent within decompressed XML
+   - Both use MD5 hashing for idempotent re-indexing
 
 2. **Retrieval Phase** (runtime via FastAPI):
-   - O(1) SQLite lookup for paper location
-   - Binary seek to exact byte offset in tar file
-   - Direct read of paper bytes (milliseconds)
+   - O(1) SQLite lookup for document location
+   - **arXiv**: Binary seek to exact byte offset in tar file
+   - **USPTO**: Open ZIP, decompress inner XML, seek to offset, read patent XML block
+   - Direct read of document bytes (milliseconds)
 
-### Database Schema
+### Database Architecture
 
-**`paper_index`** table (core fields from indexing):
+Each document type uses a **separate SQLite database file**:
+- `arXiv_manifest.sqlite3` — arXiv papers (1.27M+)
+- `uspto_manifest.sqlite3` — USPTO patents (14M+)
+
+**arXiv `paper_index`** table:
 - `paper_id` (TEXT PRIMARY KEY) - arXiv identifier (e.g., "2103.06497")
 - `archive_file` (TEXT) - Relative path to tar archive
 - `offset` (INTEGER) - Byte offset within tar file
 - `size` (INTEGER) - File size in bytes
 - `file_type` (TEXT) - Format: pdf/gzip/tar/unknown
 - `year` (INTEGER) - Publication year
+- Plus metadata fields from Kaggle: `categories`, `title`, `authors`, `abstract`, `doi`, `journal_ref`, `comments`, `versions`
 
-**Metadata fields (from Kaggle import):**
-- `categories` (TEXT) - Space-separated categories (e.g., "astro-ph.GA hep-ph")
-- `title` (TEXT) - Paper title
-- `authors` (TEXT) - Author list
-- `abstract` (TEXT) - Paper abstract
-- `doi` (TEXT) - Digital Object Identifier
-- `journal_ref` (TEXT) - Journal reference
-- `comments` (TEXT) - Author comments
-- `versions` (TEXT) - Available versions (e.g., "v1 v2 v3")
+**USPTO `patent_index`** table:
+- `patent_id` (TEXT PRIMARY KEY) - Bare document number (e.g., "11123456")
+- `archive_file` (TEXT) - ZIP filename (e.g., "PTGRXML/ipg210921.zip")
+- `offset` (INTEGER) - Byte offset within decompressed XML inside the ZIP
+- `size` (INTEGER) - Size of patent XML block in bytes
+- `doc_type` (TEXT) - "grant" or "application"
+- `kind_code` (TEXT) - Patent kind code (e.g., "B2", "A1", "S")
+- `year` (INTEGER) - Publication year
 
 ### API Endpoints
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/paper/{paper_id}` | GET | **Primary endpoint** - Retrieve paper by ID |
+| `/paper/{paper_id}` | GET | **Primary endpoint** - Retrieve arXiv paper by ID |
 | `/paper/{paper_id}/info` | GET | Get paper metadata without downloading |
 | `/paper/random` | GET | Get a random paper from local archives |
 | `/paper/categories` | GET | List available categories (legacy and modern) |
-| `/search` | GET | Full-text search with filters (requires Typesense) |
 | `/paper/{paper_id}/ir` | GET | **IR endpoint** - Get preprocessed IR package |
+| `/patent/{patent_id}` | GET | **Patent endpoint** - Retrieve USPTO patent XML |
+| `/patent/{patent_id}/info` | GET | Get patent metadata without downloading |
+| `/search` | GET | Full-text search with filters (requires Typesense) |
 | `/search/stats` | GET | Search index statistics |
 | `/health` | GET | Health check for monitoring |
 | `/debug/config` | GET | Debug configuration and cache stats |
@@ -397,6 +424,52 @@ If Typesense is not available:
 }
 ```
 
+#### GET /patent/{patent_id}
+
+**Retrieve raw USPTO patent XML by patent ID.**
+
+Patent ID normalization strips "US" prefix and trailing kind code to find the bare document number.
+
+**Patent ID formats accepted:**
+- `11123456` — bare document number
+- `US11123456B2` — with US prefix and kind code
+- `US20200123456A1` — application number
+- `D0987654S` — design patent
+- `RE12345E` — reissue patent
+
+**Response:**
+- Success (200): Raw XML content with `Content-Type: application/xml`
+- Not Found (404): Patent not in index, or USPTO retrieval not configured
+
+**Response headers:**
+- `X-Patent-ID`: Bare document number
+- `X-Patent-Kind-Code`: Kind code (B2, A1, S, etc.)
+- `X-Patent-Doc-Type`: "grant" or "application"
+- `X-Patent-Source`: "local" or "upstream"
+
+**Examples:**
+```bash
+curl http://localhost:8000/patent/11123456 -o patent.xml
+curl http://localhost:8000/patent/US11123456B2 -o patent.xml
+```
+
+#### GET /patent/{patent_id}/info
+
+Get patent metadata without downloading content.
+
+**Response (JSON):**
+```json
+{
+  "patent_id": "11123456",
+  "kind_code": "B2",
+  "doc_type": "grant",
+  "size_bytes": 111466,
+  "year": 2021,
+  "locally_available": true,
+  "source": "local"
+}
+```
+
 #### GET /health
 
 Returns service health status as JSON.
@@ -407,6 +480,7 @@ Returns service health status as JSON.
 - `upstream_configured`: Whether fallback server is configured
 - `upstream_enabled`: Whether fallback is enabled
 - `cache_configured`: Whether paper caching is enabled
+- `patent_configured`: Whether USPTO patent retrieval is enabled
 
 #### GET /debug/config
 
@@ -504,6 +578,12 @@ Via `.env` file or environment variables:
 
 The cache stores papers retrieved from upstream or local archives. When the cache is full, least recently used papers are evicted first (LRU policy).
 
+**Optional - USPTO Patent Retrieval:**
+- `PATENT_INDEX_DB_PATH` - Path to USPTO SQLite index database (enables patent endpoints)
+- `PATENT_BULK_DIR_PATH` - Path to directory containing USPTO bulk ZIP files
+
+Both must be set to enable `/patent/` endpoints. The indexer is at `index/index_uspto_bulk_files.py`.
+
 **Optional - Typesense Search:**
 - `TYPESENSE_ENABLED` - Enable search functionality (default: false)
 - `TYPESENSE_HOST` - Typesense server host (default: localhost)
@@ -575,13 +655,15 @@ The `/paper/{paper_id}/ir` endpoint requires additional setup:
 
 ## Key Files to Understand
 
-1. **`source/paperboy/retriever.py`** - Core paper retrieval logic with detailed error handling
-2. **`source/paperboy/main.py`** - FastAPI endpoints (see `/docs` for interactive API docs)
-3. **`source/paperboy/ir.py`** - IR package generation (LaTeX extraction, main tex identification, arxiv-src-ir integration)
-4. **`source/paperboy/search.py`** - Typesense search client with faceting and highlights
-4. **`source/paperboy/cache.py`** - LRU disk cache for offline paper access
-5. **`index/index_arxiv_bulk_files.py`** - Index building script
-6. **`index/sync_typesense.py`** - Sync SQLite to Typesense for full-text search
+1. **`source/paperboy/retriever.py`** - arXiv paper retrieval logic with detailed error handling
+2. **`source/paperboy/patent_retriever.py`** - USPTO patent retrieval logic (ID parsing, ZIP extraction)
+3. **`source/paperboy/main.py`** - FastAPI endpoints (see `/docs` for interactive API docs)
+4. **`source/paperboy/ir.py`** - IR package generation (LaTeX extraction, main tex identification, arxiv-src-ir integration)
+5. **`source/paperboy/search.py`** - Typesense search client with faceting and highlights
+6. **`source/paperboy/cache.py`** - LRU disk cache for offline paper access
+7. **`index/index_arxiv_bulk_files.py`** - arXiv index building script
+8. **`index/index_uspto_bulk_files.py`** - USPTO patent index building script (parallel, progress bar)
+9. **`index/sync_typesense.py`** - Sync SQLite to Typesense for full-text search
 
 ## Supported Paper ID Formats
 
@@ -730,3 +812,50 @@ After indexing, check the database:
 sqlite3 $INDEX_DB_PATH "SELECT COUNT(*) FROM paper_index;"
 sqlite3 $INDEX_DB_PATH "SELECT COUNT(*) FROM bulk_files;"
 ```
+
+## Updating the USPTO Patent Index
+
+The USPTO indexer follows the same idempotent pattern as the arXiv indexer — it tracks processed files by MD5 hash and skips them on re-runs.
+
+### Building the Index
+
+```bash
+# Full index build (uses all CPU cores minus one)
+python index/index_uspto_bulk_files.py /data/uspto --db-path index/uspto_manifest.sqlite3
+
+# With verbose per-file logging
+python index/index_uspto_bulk_files.py /data/uspto --db-path index/uspto_manifest.sqlite3 --verbose
+
+# Limit worker count
+python index/index_uspto_bulk_files.py /data/uspto --db-path index/uspto_manifest.sqlite3 --workers 4
+```
+
+The indexer scans `PTGRXML/` (grants) and `APPXML/` (applications) subdirectories for ZIP files.
+
+### How the USPTO Indexer Works
+
+1. Each ZIP contains one large XML file with thousands of concatenated patent documents
+2. Splits the XML on `<?xml` declaration boundaries
+3. Extracts patent ID, kind code, date, and doc type via regex (no lxml dependency)
+4. Records byte offset and size of each patent's XML block within the decompressed XML
+5. Stores results in `patent_index` table in a separate SQLite database
+
+### Verifying
+
+```bash
+sqlite3 index/uspto_manifest.sqlite3 "SELECT doc_type, COUNT(*) FROM patent_index GROUP BY doc_type;"
+sqlite3 index/uspto_manifest.sqlite3 "SELECT COUNT(*) FROM bulk_files;"
+```
+
+### Updating with New Data
+
+1. Download new USPTO bulk files using `corpus_downloads`:
+   ```bash
+   cd ~/repositories/corpus_downloads
+   ./uspto/uspto_downloader.py --out /data/uspto --products PTGRXML APPXML
+   ```
+2. Re-run the indexer — it will only process new/changed files:
+   ```bash
+   python index/index_uspto_bulk_files.py /data/uspto --db-path index/uspto_manifest.sqlite3
+   ```
+3. Redeploy: `./docker/build.sh deploy`
