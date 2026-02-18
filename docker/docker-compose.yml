@@ -20,8 +20,8 @@ services:
       # USPTO patent configuration
       - PATENT_INDEX_DB_PATH=/data/uspto_index.db
       - PATENT_BULK_DIR_PATH=/data/uspto
-      # Typesense: use host's service via host.docker.internal
-      - TYPESENSE_HOST=host.docker.internal
+      # Typesense: use compose service name for inter-container networking
+      - TYPESENSE_HOST=typesense
     volumes:
       - /data/paperboy_data/arXiv_manifest.sqlite3:/data/arxiv_index.db:ro
       - /data/paperboy_data/arXiv:/data/tar_files:ro
@@ -29,9 +29,25 @@ services:
       - /data/paperboy_data/uspto_manifest.sqlite3:/data/uspto_index.db:ro
       - /data/uspto:/data/uspto:ro
     restart: unless-stopped
+    depends_on:
+      typesense:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
+
+  typesense:
+    image: typesense/typesense:27.1
+    container_name: typesense
+    ports:
+      - "8108:8108"
+    env_file:
+      - ../.env
+    environment:
+      - TYPESENSE_DATA_DIR=/data
+    volumes:
+      - /data/paperboy_data/typesense-data:/data
+    restart: unless-stopped
 

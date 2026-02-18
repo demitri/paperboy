@@ -77,14 +77,9 @@ class SearchClient:
         self.settings = settings
         self.collection_name = settings.TYPESENSE_COLLECTION
         self.client: Optional[typesense.Client] = None
-        self._connected = False
+        self._enabled = settings.TYPESENSE_ENABLED and bool(settings.TYPESENSE_API_KEY)
 
-        if settings.TYPESENSE_ENABLED and settings.TYPESENSE_API_KEY:
-            self._init_client()
-
-    def _init_client(self) -> None:
-        """Initialize the Typesense client."""
-        try:
+        if self._enabled:
             self.client = typesense.Client({
                 "nodes": [{
                     "host": self.settings.TYPESENSE_HOST,
@@ -94,18 +89,17 @@ class SearchClient:
                 "api_key": self.settings.TYPESENSE_API_KEY,
                 "connection_timeout_seconds": 5,
             })
-            # Test connection by listing collections
-            self.client.collections.retrieve()
-            self._connected = True
-            logger.info(f"Connected to Typesense at {self.settings.TYPESENSE_HOST}:{self.settings.TYPESENSE_PORT}")
-        except Exception as e:
-            logger.warning(f"Failed to connect to Typesense: {e}")
-            self._connected = False
 
     @property
     def is_available(self) -> bool:
-        """Check if search is available."""
-        return self._connected and self.client is not None
+        """Check if search is available by testing the connection."""
+        if not self._enabled or self.client is None:
+            return False
+        try:
+            self.client.collections.retrieve()
+            return True
+        except Exception:
+            return False
 
     def search(
         self,

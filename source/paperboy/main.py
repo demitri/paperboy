@@ -95,7 +95,7 @@ async def root(request: Request):
 
     **AI agents should use `GET /paper/{paper_id}` or `GET /search` instead.**
     """
-    search_enabled = search_client.is_available if search_client else False
+    search_enabled = search_client._enabled if search_client else False
     return HTMLResponse(content=f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -325,6 +325,31 @@ async def root(request: Request):
             vertical-align: middle;
         }}
         @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+        .search-loading-banner {{
+            background-color: #fff3e0;
+            border: 1px solid #ffb74d;
+            border-radius: 6px;
+            padding: 12px 20px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: #e65100;
+            font-size: 14px;
+            transition: opacity 0.3s;
+        }}
+        .search-loading-banner .spinner {{
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid #ffb74d;
+            border-radius: 50%;
+            border-top-color: #e65100;
+            animation: spin 1s linear infinite;
+        }}
+        .search-loading-banner.hidden {{
+            display: none;
+        }}
         .no-search {{
             text-align: center;
             padding: 40px;
@@ -403,6 +428,11 @@ async def root(request: Request):
         <div class="tabs">
             <button class="tab active" data-tab="search">Search Papers</button>
             <button class="tab" data-tab="download">Download by ID</button>
+        </div>
+
+        <div id="searchLoadingBanner" class="search-loading-banner hidden">
+            <span class="spinner"></span>
+            <span>Search index is loading. This may take a minute...</span>
         </div>
 
         <!-- Search Tab -->
@@ -603,8 +633,9 @@ async def root(request: Request):
                 const resp = await fetch(url);
                 const data = await resp.json();
 
-                if (data.error) {{
-                    resultsDiv.innerHTML = `<div class="error">${{data.error}}</div>`;
+                const errMsg = data.error || (data.detail && (data.detail.message || data.detail.error || data.detail));
+                if (!resp.ok || errMsg) {{
+                    resultsDiv.innerHTML = `<div class="error">${{errMsg || 'Search request failed'}}</div>`;
                 }} else {{
                     renderResults(data);
                 }}
@@ -711,6 +742,36 @@ async def root(request: Request):
                 alert('Download error: ' + e.message);
             }}
         }}
+
+        // Search availability polling
+        (function() {{
+            const banner = document.getElementById('searchLoadingBanner');
+            const searchEnabled = {'true' if search_enabled else 'false'};
+            if (!searchEnabled) return;
+
+            let searchReady = false;
+
+            async function checkSearch() {{
+                try {{
+                    const resp = await fetch('/search/stats');
+                    const data = await resp.json();
+                    if (data.available) {{
+                        searchReady = true;
+                        banner.classList.add('hidden');
+                    }} else {{
+                        banner.classList.remove('hidden');
+                    }}
+                }} catch(e) {{
+                    banner.classList.remove('hidden');
+                }}
+            }}
+
+            checkSearch();
+            const interval = setInterval(() => {{
+                if (searchReady) {{ clearInterval(interval); return; }}
+                checkSearch();
+            }}, 5000);
+        }})();
 
         // Download by ID form
         const downloadForm = document.getElementById('downloadForm');
