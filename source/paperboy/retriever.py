@@ -553,13 +553,16 @@ class PaperRetriever:
             lookup_id = base_id
             metadata = self._lookup_paper_metadata(base_id)
 
-        # Check format compatibility before fetching content
+        # Check format compatibility with local metadata.
+        # If local format doesn't match, skip local retrieval but still try
+        # upstream/arXiv (they may have the requested format).
+        local_format_mismatch = False
         if metadata is not None and format and format != "preferred":
             paper_format = metadata["format"]
             if format == "pdf" and paper_format != "pdf":
-                return {"content": None, "content_type": None, "error": "format_unavailable"}
+                local_format_mismatch = True
             elif format == "source" and paper_format not in ("source",):
-                return {"content": None, "content_type": None, "error": "format_unavailable"}
+                local_format_mismatch = True
 
         # Helper to build success response
         def success_response(content: bytes, source: str, meta: Optional[Dict] = None) -> Dict[str, Any]:
@@ -581,18 +584,18 @@ class PaperRetriever:
                 "source": source,
             }
 
-        # Try cache first (enables offline access when upstream is down)
-        if self.cache:
-            result = self.cache.get(lookup_id)
-            if result is not None:
-                return success_response(result, "cache", metadata)
-
-        # Try local storage
-        result = self._get_from_local(lookup_id)
-        if result is not None:
+        # Try cache and local storage (skip if local format doesn't match request)
+        if not local_format_mismatch:
             if self.cache:
-                self.cache.put(lookup_id, result)
-            return success_response(result, "local", metadata)
+                result = self.cache.get(lookup_id)
+                if result is not None:
+                    return success_response(result, "cache", metadata)
+
+            result = self._get_from_local(lookup_id)
+            if result is not None:
+                if self.cache:
+                    self.cache.put(lookup_id, result)
+                return success_response(result, "local", metadata)
 
         # Try upstream if configured
         result = self._get_from_upstream(lookup_id)
@@ -634,6 +637,8 @@ class PaperRetriever:
         # All sources exhausted
         if try_arxiv_for_version:
             return {"content": None, "content_type": None, "error": "version_not_found"}
+        if local_format_mismatch:
+            return {"content": None, "content_type": None, "error": "format_unavailable"}
         return {"content": None, "content_type": None, "error": "not_found"}
 
     def get_random_paper(

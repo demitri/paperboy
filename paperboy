@@ -1,0 +1,191 @@
+#!/bin/bash
+# paperboy — CLI for managing Paperboy Docker deployment
+#
+# Usage:
+#   ./paperboy status     Show container status, health, and Typesense info
+#   ./paperboy redeploy   Rebuild image and restart containers
+#   ./paperboy restart    Restart containers without rebuilding
+#   ./paperboy logs       Tail container logs
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_FILE="$SCRIPT_DIR/docker/docker-compose.yml"
+ARXIV_SRC_IR_PATH="${ARXIV_SRC_IR_PATH:-/home/demitri/repositories/arxiv-src-ir/python}"
+
+# ---------------------------------------------------------------------------
+# Colors (disabled when output is not a terminal)
+# ---------------------------------------------------------------------------
+
+if [ -t 1 ]; then
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    CYAN='\033[0;36m'
+    RESET='\033[0m'
+else
+    BOLD='' DIM='' RED='' GREEN='' YELLOW='' CYAN='' RESET=''
+fi
+
+header()  { echo -e "${BOLD}${CYAN}==> $*${RESET}"; }
+success() { echo -e "${GREEN}$*${RESET}"; }
+warn()    { echo -e "${YELLOW}$*${RESET}"; }
+error()   { echo -e "${RED}$*${RESET}"; }
+dim()     { echo -e "${DIM}$*${RESET}"; }
+label()   { echo -e "  ${BOLD}$1${RESET} $2"; }
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+wait_for_healthy() {
+    header "Waiting for health check..."
+    for i in {1..12}; do
+        if docker ps --format '{{.Names}} {{.Status}}' | grep -q "paperboy.*healthy"; then
+            success "==> Paperboy is healthy!"
+            return 0
+        fi
+        sleep 5
+    done
+    error "==> Container did not become healthy within 60s. Recent logs:"
+    docker compose -f "$COMPOSE_FILE" logs --tail=30
+    return 1
+}
+
+typesense_status() {
+    # Check if the typesense container is running
+    if ! docker ps --format '{{.Names}}' | grep -q '^typesense$'; then
+        error "not running"
+        return
+    fi
+
+    # Check if TYPESENSE_API_KEY is set in .env
+    if [ -f "$SCRIPT_DIR/.env" ]; then
+        TS_KEY=$(grep -E '^TYPESENSE_API_KEY=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)
+    fi
+    if [ -z "$TS_KEY" ]; then
+        warn "running (API key missing from .env)"
+        return
+    fi
+
+    # Try the health endpoint
+    if curl -sf "http://localhost:8108/health" > /dev/null 2>&1; then
+        success "running / connected"
+    else
+        warn "running / not ready"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_status() {
+    header "Container overview"
+    docker compose -f "$COMPOSE_FILE" ps 2>/dev/null || dim "(no containers found)"
+
+    echo ""
+    header "Image info"
+    CREATED=$(docker inspect --format '{{.Created}}' paperboy:latest 2>/dev/null) || true
+    if [ -n "$CREATED" ]; then
+        label "paperboy:latest created:" "$CREATED"
+    else
+        warn "  paperboy:latest image not found"
+    fi
+
+    echo ""
+    header "Container health"
+    HEALTH=$(docker inspect --format '{{.State.Health.Status}}' paperboy 2>/dev/null) || true
+    if [ -n "$HEALTH" ]; then
+        case "$HEALTH" in
+            healthy)   label "paperboy:" "$(success "$HEALTH")" ;;
+            unhealthy) label "paperboy:" "$(error "$HEALTH")" ;;
+            *)         label "paperboy:" "$(warn "$HEALTH")" ;;
+        esac
+    else
+        warn "  paperboy container not running"
+    fi
+
+    echo ""
+    header "Paperboy /health endpoint"
+    if HEALTH_RESP=$(curl -sf "http://localhost:8000/health" 2>/dev/null); then
+        if command -v python3 > /dev/null 2>&1; then
+            echo "$HEALTH_RESP" | python3 -m json.tool | while IFS= read -r line; do
+                success "  $line"
+            done
+        else
+            success "  $HEALTH_RESP"
+        fi
+    else
+        warn "  not reachable"
+    fi
+
+    echo ""
+    header "Typesense status"
+    echo -n "  "
+    typesense_status
+}
+
+cmd_redeploy() {
+    header "Checking arxiv-src-ir source..."
+    if [ ! -d "$ARXIV_SRC_IR_PATH" ]; then
+        error "ERROR: arxiv-src-ir not found at: $ARXIV_SRC_IR_PATH"
+        echo ""
+        echo "Set ARXIV_SRC_IR_PATH environment variable to the correct location:"
+        dim "  export ARXIV_SRC_IR_PATH=/path/to/arxiv-src-ir/python"
+        exit 1
+    fi
+
+    header "Copying arxiv-src-ir into build context..."
+    rm -rf "$SCRIPT_DIR/arxiv-src-ir"
+    cp -r "$ARXIV_SRC_IR_PATH" "$SCRIPT_DIR/arxiv-src-ir"
+
+    cleanup() {
+        header "Cleaning up arxiv-src-ir copy..."
+        rm -rf "$SCRIPT_DIR/arxiv-src-ir"
+    }
+    trap cleanup EXIT
+
+    header "Building Docker image..."
+    docker build -f docker/Dockerfile -t paperboy:latest "$SCRIPT_DIR"
+
+    header "Restarting containers..."
+    docker compose -f "$COMPOSE_FILE" up -d
+
+    wait_for_healthy
+}
+
+cmd_restart() {
+    header "Restarting containers..."
+    docker compose -f "$COMPOSE_FILE" up -d
+
+    wait_for_healthy
+}
+
+cmd_logs() {
+    docker compose -f "$COMPOSE_FILE" logs -f --tail=50
+}
+
+cmd_help() {
+    echo -e "${BOLD}Usage:${RESET} paperboy <command>"
+    echo ""
+    echo -e "${BOLD}Commands:${RESET}"
+    echo -e "  ${CYAN}status${RESET}     Show container status, health, and Typesense info"
+    echo -e "  ${CYAN}redeploy${RESET}   Rebuild image and restart containers"
+    echo -e "  ${CYAN}restart${RESET}    Restart containers without rebuilding"
+    echo -e "  ${CYAN}logs${RESET}       Tail container logs"
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+case "${1:-}" in
+    status)    cmd_status ;;
+    redeploy)  cmd_redeploy ;;
+    restart)   cmd_restart ;;
+    logs)      cmd_logs ;;
+    *)         cmd_help ;;
+esac

@@ -1550,11 +1550,17 @@ async def get_paper_ir(
         tar_hint = get_expected_tar_pattern(paper_id)
 
         if error_reason == "format_unavailable":
+            # Get paper info so we can report what format IS available
+            paper_info = retriever.get_paper_info(paper_id)
+            local_file_type = paper_info.get("file_type") if paper_info else None
             raise HTTPException(
                 status_code=422,
                 detail={
-                    "message": f"Paper '{paper_id}' is not available as LaTeX source. IR packages require source, not PDF.",
+                    "message": f"Paper '{paper_id}' is not available as LaTeX source (locally stored as {local_file_type or 'unknown'}). "
+                               f"Upstream and arXiv fallback were also tried but did not return source.",
                     "error": "source_unavailable",
+                    "paper_id": paper_id,
+                    "local_file_type": local_file_type,
                 }
             )
         else:
@@ -1563,6 +1569,7 @@ async def get_paper_ir(
                 detail={
                     "message": f"Paper with ID '{paper_id}' not found.",
                     "error": "not_found",
+                    "paper_id": paper_id,
                     "tar_hint": tar_hint,
                 }
             )
@@ -1581,6 +1588,7 @@ async def get_paper_ir(
             detail={
                 "message": f"Failed to generate IR package for '{paper_id}': {error}",
                 "error": "ir_generation_failed",
+                "paper_id": paper_id,
             }
         )
 
